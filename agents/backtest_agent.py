@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import time
+import importlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -38,8 +39,23 @@ def run_single_backtest(args):
     return instrument, result
 
 
-def run_parallel_backtest(params):
+def reload_strategy():
+    """Перезагружает модули стратегии для подхвата code changes."""
+    import strategy.base_strategy
+    import backtest.runner
+    importlib.reload(strategy.base_strategy)
+    importlib.reload(backtest.runner)
+    # Re-import after reload
+    global run_backtest, calculate_metrics
+    from backtest.runner import run_backtest, calculate_metrics
+    print("  [BacktestAgent] Strategy modules reloaded")
+
+
+def run_parallel_backtest(params, force_reload=False):
     """Запускает бэктест по всем инструментам параллельно."""
+    if force_reload:
+        reload_strategy()
+
     instruments = get_instruments()
     if not instruments:
         print("  [BacktestAgent] No instruments found")
@@ -50,7 +66,11 @@ def run_parallel_backtest(params):
     results = {}
     args_list = [(inst, params) for inst in instruments]
 
-    with ProcessPoolExecutor(max_workers=min(4, len(instruments))) as executor:
+    # Use 'spawn' context to get fresh imports in workers (important for code changes)
+    import multiprocessing
+    ctx = multiprocessing.get_context("spawn")
+
+    with ProcessPoolExecutor(max_workers=min(4, len(instruments)), mp_context=ctx) as executor:
         futures = {executor.submit(run_single_backtest, args): args[0] for args in args_list}
         for future in as_completed(futures):
             instrument = futures[future]
@@ -232,8 +252,8 @@ def watch():
                 # Удаляем запрос
                 os.remove(REQUEST_FILE)
 
-                # Запускаем параллельный бэктест
-                results = run_parallel_backtest(params)
+                # Запускаем параллельный бэктест (reload при code changes)
+                results = run_parallel_backtest(params, force_reload=True)
                 save_metrics(results)
                 generate_trade_log(results)
 
