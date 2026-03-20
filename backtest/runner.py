@@ -99,21 +99,31 @@ def calculate_metrics(trades):
 def calculate_score(sharpe, profit_factor, max_drawdown, winrate, total_trades):
     """
     Composite score для оптимизации.
-    score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1
+    Плавная шкала вместо бинарных штрафов — оптимизатор видит прогресс.
 
-    Штрафы (score = 0):
-    - меньше 30 сделок
-    - max_drawdown > 0.10
-    - winrate < 0.40
+    score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1 - winrate_penalty
     """
-    if total_trades < 30:
-        return 0
-    if max_drawdown > 0.10:
-        return 0
-    if winrate < 0.40:
+    if total_trades < 10:
         return 0
 
-    return sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1
+    # Плавный штраф за низкий WR (вместо бинарного отсечения)
+    winrate_penalty = max(0, 0.40 - winrate) * 2.0
+
+    # Плавный штраф за drawdown (вместо бинарного)
+    dd_penalty = max(0, max_drawdown - 0.10) * 3.0
+
+    # Штраф за мало сделок (плавный от 10 до 30)
+    trade_penalty = max(0, (30 - total_trades) / 30) * 0.5 if total_trades < 30 else 0
+
+    score = (sharpe * 0.4
+             + profit_factor * 0.3
+             - max_drawdown * 0.2
+             + winrate * 0.1
+             - winrate_penalty
+             - dd_penalty
+             - trade_penalty)
+
+    return score
 
 
 def run_backtest(instrument, params=None):
@@ -141,11 +151,11 @@ def run_backtest(instrument, params=None):
     print(f"  Running backtest: {instrument} (H1: {len(df_h1)}, M3: {len(df_m3)} candles)")
 
     # Генерируем сигналы
-    signals = generate_signals(df_h1, df_m3, params)
+    signals = generate_signals(df_h1, df_m3, params, instrument=instrument)
     print(f"  Signals found: {len(signals)}")
 
     # Симулируем сделки
-    trades = simulate_trades(signals, df_m3, params)
+    trades = simulate_trades(signals, df_m3, params, instrument=instrument)
     print(f"  Trades executed: {len(trades)}")
 
     # Считаем метрики

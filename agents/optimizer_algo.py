@@ -29,6 +29,7 @@ PARAM_CONFIG = {
     "be_trigger_rr":           {"min": 0.3, "max": 0.7, "step": 0.05, "type": "float"},
     "tp_rr_ratio":             {"min": 1.5, "max": 3.0, "step": 0.1,  "type": "float"},
     "min_atr_percentile":      {"min": 20,  "max": 60,  "step": 5,    "type": "int"},
+    "fvg_max_age_bars":        {"min": 5,   "max": 50,  "step": 5,    "type": "int"},
 }
 
 

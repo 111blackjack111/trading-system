@@ -26,6 +26,7 @@ PARAM_RANGES = {
     "be_trigger_rr": (0.3, 0.7),
     "tp_rr_ratio": (1.5, 3.0),
     "min_atr_percentile": (20, 60),
+    "fvg_max_age_bars": (5, 50),
 }
 
 

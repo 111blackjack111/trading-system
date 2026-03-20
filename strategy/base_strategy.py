@@ -201,7 +201,14 @@ def is_after_close(timestamp):
 # Генератор сигналов
 # ============================================================
 
-def generate_signals(df_h1, df_m3, params):
+def is_crypto_instrument(instrument):
+    """Проверяет является ли инструмент криптовалютой."""
+    crypto = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+              "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+    return instrument in crypto if instrument else False
+
+
+def generate_signals(df_h1, df_m3, params, instrument=None):
     """
     Генерирует торговые сигналы на основе SMC логики.
 
@@ -209,10 +216,14 @@ def generate_signals(df_h1, df_m3, params):
         df_h1: DataFrame с H1 данными (тренд + FVG)
         df_m3: DataFrame с M3 данными (вход)
         params: словарь параметров стратегии
+        instrument: название инструмента (для определения крипта/форекс)
 
     Returns:
         list of dict: сигналы [{timestamp, direction, entry, sl, tp, fvg}, ...]
     """
+    is_crypto = is_crypto_instrument(instrument)
+    fvg_max_age = params.get("fvg_max_age_bars", 20)
+
     # 1. Определяем тренд на H1
     trend = detect_bos(df_h1, params["bos_swing_length"])
 
@@ -239,23 +250,31 @@ def generate_signals(df_h1, df_m3, params):
 
         active_fvgs.append(fvg)
 
+    # Построим маппинг H1 timestamps -> bar index для проверки возраста FVG
+    h1_time_to_idx = {ts: i for i, ts in enumerate(df_h1.index)}
+
     # 4. Ищем входы на M3
     for i in range(1, len(df_m3)):
         ts = df_m3.index[i]
 
-        # Фильтры времени
-        if is_monday_opening(ts):
-            continue
-        if is_after_close(ts):
-            continue
-        if not session_filter(ts, params):
-            continue
+        # Фильтры времени — для крипты отключены
+        if not is_crypto:
+            if is_monday_opening(ts):
+                continue
+            if is_after_close(ts):
+                continue
+            if not session_filter(ts, params):
+                continue
 
-        # Фильтр волатильности
+        # Фильтр волатильности (работает для всех)
         if i < 14:
             continue
         if not volatility_filter(atr_m3.iloc[i], atr_m3.iloc[:i], params):
             continue
+
+        # Текущий H1 бар (округляем M3 timestamp до часа)
+        current_h1_time = ts.floor("h")
+        current_h1_idx = h1_time_to_idx.get(current_h1_time)
 
         # Проверяем каждый активный FVG
         remaining_fvgs = []
@@ -264,6 +283,12 @@ def generate_signals(df_h1, df_m3, params):
             if fvg["timestamp"] > ts:
                 remaining_fvgs.append(fvg)
                 continue
+
+            # Проверяем возраст FVG
+            if current_h1_idx is not None:
+                fvg_age = current_h1_idx - fvg["index"]
+                if fvg_age > fvg_max_age:
+                    continue  # FVG слишком старый — удаляем
 
             close = df_m3["close"].iloc[i]
             low = df_m3["low"].iloc[i]
@@ -278,6 +303,8 @@ def generate_signals(df_h1, df_m3, params):
                     atr_val = atr_m3.iloc[i] if not np.isnan(atr_m3.iloc[i]) else atr_h1.iloc[-1]
                     sl = fvg["bottom"] - atr_val * params["sl_atr_multiplier"]
                     risk = close - sl
+                    if risk <= 0:
+                        continue
                     tp = close + risk * params["tp_rr_ratio"]
                     be_level = close + risk * params["be_trigger_rr"]
 
@@ -299,6 +326,8 @@ def generate_signals(df_h1, df_m3, params):
                     atr_val = atr_m3.iloc[i] if not np.isnan(atr_m3.iloc[i]) else atr_h1.iloc[-1]
                     sl = fvg["top"] + atr_val * params["sl_atr_multiplier"]
                     risk = sl - close
+                    if risk <= 0:
+                        continue
                     tp = close - risk * params["tp_rr_ratio"]
                     be_level = close - risk * params["be_trigger_rr"]
 
@@ -325,7 +354,7 @@ def generate_signals(df_h1, df_m3, params):
 # Симуляция сделок
 # ============================================================
 
-def simulate_trades(signals, df_m3, params):
+def simulate_trades(signals, df_m3, params, instrument=None):
     """
     Симулирует сделки по сигналам.
     Для каждого сигнала проверяет: достиг TP, SL, или BE.
@@ -333,6 +362,7 @@ def simulate_trades(signals, df_m3, params):
     Returns:
         list of dict: сделки с результатами
     """
+    is_crypto = is_crypto_instrument(instrument)
     trades = []
 
     for signal in signals:
@@ -356,8 +386,8 @@ def simulate_trades(signals, df_m3, params):
             bar = future_bars.iloc[j]
             bar_time = future_bars.index[j]
 
-            # Закрытие до 22:00 UTC+3
-            if is_after_close(bar_time):
+            # Закрытие до 22:00 UTC+3 — только для форекс
+            if not is_crypto and is_after_close(bar_time):
                 exit_price = bar["close"]
                 exit_time = bar_time
                 result = "time_exit"

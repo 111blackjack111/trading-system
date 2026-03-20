@@ -10,6 +10,7 @@
   "silver_bullet_only": false,
   "volatility_filter": true,
   "min_atr_percentile": 40,
+  "fvg_max_age_bars": 20,
   "news_filter": true,
   "crypto_hours_filter": true
 }
