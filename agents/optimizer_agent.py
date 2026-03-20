@@ -32,30 +32,44 @@ PARAM_RANGES = {
 }
 
 
-def get_experiment_history(limit=20):
-    """Читает последние эксперименты из SQLite."""
+def get_experiment_history():
+    """Читает top-5 лучших + последние 3 эксперимента (экономия токенов)."""
     if not os.path.exists(DB_PATH):
-        return []
+        return {"top_5": [], "last_3": []}
 
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
+    result = {"top_5": [], "last_3": []}
+
     try:
+        # Top 5 by avg_score
         cursor.execute("""
             SELECT iteration, param_changed, old_value, new_value,
-                   avg_score, best_score, action, notes
+                   avg_score, best_score, action
+            FROM experiments
+            WHERE action = 'keep' OR action = 'baseline'
+            ORDER BY avg_score DESC
+            LIMIT 5
+        """)
+        result["top_5"] = [dict(r) for r in cursor.fetchall()]
+
+        # Last 3
+        cursor.execute("""
+            SELECT iteration, param_changed, old_value, new_value,
+                   avg_score, best_score, action
             FROM experiments
             ORDER BY iteration DESC
-            LIMIT ?
-        """, (limit,))
-        rows = [dict(r) for r in cursor.fetchall()]
+            LIMIT 3
+        """)
+        result["last_3"] = [dict(r) for r in cursor.fetchall()]
     except sqlite3.OperationalError:
-        rows = []
+        pass
     finally:
         conn.close()
 
-    return rows
+    return result
 
 
 def get_current_metrics():
@@ -74,12 +88,24 @@ def get_current_metrics():
 
 
 def get_trade_log():
-    """Читает trade_log.json с аналитикой сделок."""
+    """Читает trade_log.json и возвращает компактную версию (экономия токенов)."""
     path = os.path.join(RUNTIME_DIR, "trade_log.json")
     if not os.path.exists(path):
         return None
     with open(path) as f:
-        return json.load(f)
+        full = json.load(f)
+
+    # Компактная версия: только ключевые метрики + 5 последних losers
+    summary = {
+        "total_trades": full.get("total_trades"),
+        "overall_winrate": full.get("overall_winrate"),
+        "win_by_session": full.get("win_by_session"),
+        "win_by_instrument": full.get("win_by_instrument"),
+        "avg_bars_to_stop": full.get("avg_bars_to_stop"),
+        "exit_reason_breakdown": full.get("exit_reason_breakdown"),
+        "recent_losers_5": full.get("losing_trades", [])[-5:],
+    }
+    return summary
 
 
 def get_strategy_code():
@@ -122,9 +148,9 @@ Overall WR: {trade_log.get('overall_winrate', 0):.1%} ({trade_log.get('total_tra
 {json.dumps(trade_log.get('exit_reason_breakdown', {}), indent=2)}
 ```
 
-### Recent Losing Trades (last 20)
+### Recent Losing Trades (last 5)
 ```json
-{json.dumps(trade_log.get('losing_trades', []), indent=2)}
+{json.dumps(trade_log.get('recent_losers_5', []), indent=2)}
 ```
 """
 
@@ -182,8 +208,11 @@ Your job is to improve an SMC (Smart Money Concepts) trading strategy.
 {json.dumps(metrics, indent=2)}
 ```
 {trade_log_section}
-## Recent Experiment History (most recent first)
-{json.dumps(history, indent=2) if history else "No previous experiments yet."}
+## Best Experiments (top 5)
+{json.dumps(history.get("top_5", []), indent=2) if history else "None yet"}
+
+## Last 3 Experiments
+{json.dumps(history.get("last_3", []), indent=2) if history else "None yet"}
 
 ## Score Formula
 score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1
@@ -236,7 +265,7 @@ def suggest_change(params=None):
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
     response = client.messages.create(
         model="claude-4-sonnet-20250514",
-        max_tokens=2000 if allow_code_changes else 500,
+        max_tokens=1500 if allow_code_changes else 300,
         messages=[{"role": "user", "content": prompt}],
     )
 
