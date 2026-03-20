@@ -13,6 +13,10 @@ import time
 import subprocess
 from datetime import datetime, timezone
 
+# Unbuffered output for tee/logs
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 
