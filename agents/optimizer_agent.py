@@ -132,7 +132,7 @@ def suggest_change(params=None):
 
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
     response = client.messages.create(
-        model="claude-sonnet-4-5-20250514",
+        model="claude-4-sonnet-20250514",
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}],
     )
