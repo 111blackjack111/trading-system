@@ -16,6 +16,7 @@ echo "Iterations: $ITERATIONS"
 tmux kill-session -t backtest 2>/dev/null
 tmux kill-session -t orchestrator 2>/dev/null
 tmux kill-session -t impulse 2>/dev/null
+tmux kill-session -t monitor 2>/dev/null
 
 # 1. BacktestAgent — параллельный бэктест, слушает запросы
 echo "Starting BacktestAgent..."
@@ -46,6 +47,15 @@ echo 'ImpulseAgent: Switching to live monitoring...'
 python3 agents/impulse_agent.py --mode live 2>&1 | tee -a results/impulse.log
 "
 
+# 4. MonitorAgent — следит за здоровьем, шлёт Telegram отчёты
+echo "Starting MonitorAgent..."
+tmux new-session -d -s monitor "
+cd $DIR && source $VENV
+export TELEGRAM_BOT_TOKEN='${TELEGRAM_BOT_TOKEN}'
+export TELEGRAM_CHAT_ID='${TELEGRAM_CHAT_ID}'
+python3 agents/monitor_agent.py 2>&1 | tee results/monitor.log
+"
+
 echo ""
 echo "=== All agents started ==="
 echo ""
@@ -56,4 +66,5 @@ echo "Commands:"
 echo "  tmux attach -t orchestrator  # watch optimization"
 echo "  tmux attach -t backtest      # watch backtests"
 echo "  tmux attach -t impulse       # watch impulse scanner"
+echo "  tmux attach -t monitor       # watch monitor/telegram"
 echo "  Ctrl+B, D                    # detach from session"
