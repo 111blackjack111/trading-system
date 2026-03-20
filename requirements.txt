@@ -6,3 +6,4 @@ anthropic
 pandas
 numpy
 python-telegram-bot
+yfinance
