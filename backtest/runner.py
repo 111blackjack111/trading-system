@@ -76,8 +76,9 @@ def calculate_metrics(trades):
     peak = np.maximum.accumulate(cumulative)
     drawdown = (peak - cumulative)
     max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
-    # Нормализуем к доле от пика
-    max_dd_pct = max_drawdown / (abs(peak.max()) + 0.001)
+    # Нормализуем к доле от пика (cap at 1.0 to avoid explosion when peak ≈ 0)
+    peak_val = abs(peak.max())
+    max_dd_pct = max_drawdown / (peak_val + 0.001) if peak_val > 0.1 else min(max_drawdown, 1.0)
 
     avg_rr = np.mean(pnls)
 
