@@ -32,7 +32,7 @@ RESULTS_TSV = os.path.join(RESULTS_DIR, "results.tsv")
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
-TIMEOUT_BACKTEST = 600  # 10 минут макс на бэктест
+TIMEOUT_BACKTEST = 1200  # 20 минут макс на бэктест
 
 
 def init_db():
@@ -105,7 +105,7 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
 
     metrics_all = backtest_result.get("results", {})
     scores, winrates, pfs = [], [], []
-    best_score, best_inst, total_trades = 0, "", 0
+    best_score, best_inst, total_trades = -float("inf"), "", 0
 
     for inst, m in metrics_all.items():
         if m and m.get("score") is not None:
@@ -117,7 +117,13 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
                 best_score = m["score"]
                 best_inst = inst
 
-    avg_score = sum(scores) / len(scores) if scores else 0
+    # Use pre-computed avg_score from backtest agent as fallback
+    if scores:
+        avg_score = sum(scores) / len(scores)
+    else:
+        avg_score = backtest_result.get("avg_score", 0)
+    if best_score == -float("inf"):
+        best_score = 0
 
     conn.execute("""
         INSERT INTO experiments
@@ -200,9 +206,31 @@ def run(max_iterations=100, skip_data_download=False):
             continue
 
         # Применяем
-        new_params = params_backup.copy()
-        new_params[suggestion["param"]] = suggestion["new_value"]
-        save_params(new_params)
+        change_type = suggestion.get("type", "param_change")
+        strategy_backup = None
+
+        if change_type == "code_change":
+            # Code change — модифицируем base_strategy.py
+            strategy_path = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_strategy.py")
+            with open(strategy_path) as f:
+                strategy_backup = f.read()
+
+            old_code = suggestion.get("old_code", "")
+            new_code = suggestion.get("new_code", "")
+
+            if old_code and new_code and old_code in strategy_backup:
+                new_strategy = strategy_backup.replace(old_code, new_code, 1)
+                with open(strategy_path, "w") as f:
+                    f.write(new_strategy)
+                print(f"  [Orchestrator] Applied code change: {suggestion.get('change_description', 'N/A')}")
+                new_params = params_backup.copy()
+            else:
+                print(f"  [Orchestrator] Code change failed — old_code not found, skipping")
+                continue
+        else:
+            new_params = params_backup.copy()
+            new_params[suggestion["param"]] = suggestion["new_value"]
+            save_params(new_params)
 
         # Backtest (через агента — параллельно)
         print("\n  [Backtest] Requesting parallel backtest...")
@@ -221,9 +249,15 @@ def run(max_iterations=100, skip_data_download=False):
             print(f"\n  KEEP: score {new_score:.4f} (+{improvement:.4f})")
         else:
             action = "revert"
-            save_params(params_backup)
+            if change_type == "code_change" and strategy_backup:
+                strategy_path = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_strategy.py")
+                with open(strategy_path, "w") as f:
+                    f.write(strategy_backup)
+                print(f"\n  REVERT CODE: score {new_score:.4f} (best: {best_score:.4f})")
+            else:
+                save_params(params_backup)
+                print(f"\n  REVERT: score {new_score:.4f} (best: {best_score:.4f})")
             no_improvement_count += 1
-            print(f"\n  REVERT: score {new_score:.4f} (best: {best_score:.4f})")
 
         save_experiment(i, suggestion, bt_result, action, new_params)
 

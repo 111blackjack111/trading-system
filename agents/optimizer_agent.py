@@ -1,7 +1,8 @@
 """
-OptimizerAgent — использует Claude API для предложения изменений параметров.
-Читает текущие params.json и историю экспериментов.
-Предлагает ОДНО изменение одного параметра за итерацию.
+OptimizerAgent v3 — использует Claude API для предложения изменений.
+
+Cycle 3: Читает trade_log.json с аналитикой проигрышных сделок.
+Если WR < 25% — может предлагать изменения в base_strategy.py (не только params).
 """
 
 import os
@@ -15,6 +16,7 @@ from strategy.base_strategy import load_params
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "experiments.db")
+STRATEGY_PATH = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_strategy.py")
 
 # Диапазоны параметров для оптимизации
 PARAM_RANGES = {
@@ -71,10 +73,99 @@ def get_current_metrics():
     return metrics
 
 
-def build_prompt(params, history, metrics):
+def get_trade_log():
+    """Читает trade_log.json с аналитикой сделок."""
+    path = os.path.join(RUNTIME_DIR, "trade_log.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def get_strategy_code():
+    """Читает текущий код стратегии (для code-change mode)."""
+    if not os.path.exists(STRATEGY_PATH):
+        return ""
+    with open(STRATEGY_PATH) as f:
+        return f.read()
+
+
+def compute_avg_winrate(metrics):
+    """Считает средний WR по всем инструментам."""
+    winrates = [m.get("winrate", 0) for m in metrics.values() if m]
+    return sum(winrates) / len(winrates) if winrates else 0
+
+
+def build_prompt(params, history, metrics, trade_log, allow_code_changes=False):
     """Строит промпт для Claude."""
-    prompt = f"""You are an AI trading strategy optimizer. Your job is to suggest ONE parameter change
-to improve the SMC (Smart Money Concepts) trading strategy.
+
+    trade_log_section = ""
+    if trade_log:
+        trade_log_section = f"""
+## Trade Analysis (trade_log.json)
+Overall WR: {trade_log.get('overall_winrate', 0):.1%} ({trade_log.get('total_trades', 0)} trades)
+
+### Win Rate by Session
+```json
+{json.dumps(trade_log.get('win_by_session', {}), indent=2)}
+```
+
+### Win Rate by Instrument
+```json
+{json.dumps(trade_log.get('win_by_instrument', {}), indent=2)}
+```
+
+### Average Bars to Stop-Loss: {trade_log.get('avg_bars_to_stop', 'N/A')}
+
+### Exit Reason Breakdown
+```json
+{json.dumps(trade_log.get('exit_reason_breakdown', {}), indent=2)}
+```
+
+### Recent Losing Trades (last 20)
+```json
+{json.dumps(trade_log.get('losing_trades', []), indent=2)}
+```
+"""
+
+    code_change_section = ""
+    if allow_code_changes:
+        strategy_code = get_strategy_code()
+        code_change_section = f"""
+## CODE CHANGE MODE (WR < 25%)
+Win rate is critically low. Parameter changes alone are insufficient.
+You MAY suggest a code change to strategy/base_strategy.py instead of a parameter change.
+
+### Current Strategy Code
+```python
+{strategy_code}
+```
+
+### Allowed Code Changes
+You can suggest ONE of these types of changes:
+1. **Add confirmation candle** — require a bullish/bearish close after FVG touch before entry
+2. **Add multi-timeframe filter** — e.g., require M15 trend alignment
+3. **Add time-of-day filter** — block specific hours that lose consistently
+4. **Modify entry logic** — e.g., wait for price to close back inside FVG (not just touch)
+5. **Modify SL/TP logic** — e.g., trail stop, partial TP, dynamic RR
+6. **Add instrument-specific filter** — disable instruments with WR < 10%
+
+### Code Change Response Format
+If you suggest a code change, respond with:
+```json
+{{
+    "type": "code_change",
+    "change_description": "Brief description of what to change",
+    "function_name": "name of function to modify",
+    "old_code": "exact code to replace (copy-paste from above)",
+    "new_code": "replacement code",
+    "reasoning": "Why this should improve WR"
+}}
+```
+"""
+
+    prompt = f"""You are an AI trading strategy optimizer using autoresearch methodology.
+Your job is to improve an SMC (Smart Money Concepts) trading strategy.
 
 ## Current Parameters
 ```json
@@ -90,27 +181,30 @@ to improve the SMC (Smart Money Concepts) trading strategy.
 ```json
 {json.dumps(metrics, indent=2)}
 ```
-
+{trade_log_section}
 ## Recent Experiment History (most recent first)
 {json.dumps(history, indent=2) if history else "No previous experiments yet."}
 
 ## Score Formula
 score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1
-Penalties (score=0): <30 trades, max_drawdown>0.10, winrate<0.40
-
+Smooth penalties for: winrate < 0.40, drawdown > 0.10, trades < 30
+{code_change_section}
 ## Rules
-1. Suggest EXACTLY ONE parameter change
-2. Stay within the allowed ranges
+1. Analyze the trade_log data carefully — find PATTERNS in losses
+2. If suggesting a parameter change: stay within allowed ranges
 3. Consider what worked and what didn't in history
-4. If many recent changes were reverted, try a different direction
+4. If many recent changes were reverted, try a DIFFERENT approach
 5. Think about WHY a change might help based on SMC logic
+6. Look at which sessions/instruments perform worst — target those
 
 ## Response Format (JSON only)
+For parameter changes:
 {{
+    "type": "param_change",
     "param": "parameter_name",
     "old_value": current_value,
     "new_value": suggested_value,
-    "reasoning": "Brief explanation of why this change should improve the score"
+    "reasoning": "Brief explanation based on trade_log analysis"
 }}"""
 
     return prompt
@@ -128,13 +222,21 @@ def suggest_change(params=None):
 
     history = get_experiment_history()
     metrics = get_current_metrics()
+    trade_log = get_trade_log()
 
-    prompt = build_prompt(params, history, metrics)
+    # Определяем режим: параметры или код
+    avg_wr = compute_avg_winrate(metrics)
+    allow_code_changes = avg_wr < 0.25
+
+    if allow_code_changes:
+        print("  [Optimizer] CODE CHANGE MODE enabled (WR < 25%)")
+
+    prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes)
 
     client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
     response = client.messages.create(
         model="claude-4-sonnet-20250514",
-        max_tokens=500,
+        max_tokens=2000 if allow_code_changes else 500,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -149,24 +251,39 @@ def suggest_change(params=None):
 
     suggestion = json.loads(text)
 
-    # Валидация
-    param = suggestion["param"]
-    if param not in PARAM_RANGES:
-        raise ValueError(f"Unknown parameter: {param}")
+    # Обработка по типу
+    change_type = suggestion.get("type", "param_change")
 
-    low, high = PARAM_RANGES[param]
-    new_val = suggestion["new_value"]
-    if not (low <= new_val <= high):
-        raise ValueError(f"{param}={new_val} out of range [{low}, {high}]")
+    if change_type == "code_change":
+        # Код стратегии
+        print(f"  CODE CHANGE: {suggestion.get('change_description', 'N/A')}")
+        print(f"  Function: {suggestion.get('function_name', 'N/A')}")
+        print(f"  Reasoning: {suggestion.get('reasoning', 'N/A')}")
 
-    # Сохраняем предложение
+        # Сохраняем предложение
+        suggestion["param"] = "code_change"
+        suggestion["old_value"] = 0
+        suggestion["new_value"] = 0
+
+    else:
+        # Параметр
+        param = suggestion.get("param")
+        if not param or param not in PARAM_RANGES:
+            raise ValueError(f"Unknown parameter: {param}")
+
+        low, high = PARAM_RANGES[param]
+        new_val = suggestion["new_value"]
+        if not (low <= new_val <= high):
+            raise ValueError(f"{param}={new_val} out of range [{low}, {high}]")
+
+        print(f"  Suggestion: {param} {suggestion.get('old_value')} -> {suggestion['new_value']}")
+        print(f"  Reasoning: {suggestion.get('reasoning', 'N/A')}")
+
+    # Сохраняем
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     suggestion_path = os.path.join(RUNTIME_DIR, "suggestion.json")
     with open(suggestion_path, "w") as f:
         json.dump(suggestion, f, indent=2)
-
-    print(f"  Suggestion: {param} {suggestion['old_value']} -> {suggestion['new_value']}")
-    print(f"  Reasoning: {suggestion['reasoning']}")
 
     return suggestion
 
