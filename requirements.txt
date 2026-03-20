@@ -1,0 +1,8 @@
+smartmoneyconcepts
+backtesting
+oandapyV20
+ccxt
+anthropic
+pandas
+numpy
+python-telegram-bot

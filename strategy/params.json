@@ -1,0 +1,15 @@
+{
+  "fvg_min_size_multiplier": 0.3,
+  "fvg_entry_depth": 0.5,
+  "ob_lookback": 15,
+  "bos_swing_length": 10,
+  "sl_atr_multiplier": 1.5,
+  "be_trigger_rr": 0.5,
+  "tp_rr_ratio": 2.0,
+  "session_filter": true,
+  "silver_bullet_only": false,
+  "volatility_filter": true,
+  "min_atr_percentile": 40,
+  "news_filter": true,
+  "crypto_hours_filter": true
+}
