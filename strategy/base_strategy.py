@@ -300,7 +300,10 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                 entry_level = fvg["top"] - (fvg["top"] - fvg["bottom"]) * entry_depth
                 if low <= entry_level and close > fvg["bottom"]:
                     # Реакция от FVG — close выше дна зоны
-                    atr_val = atr_m3.iloc[i] if not np.isnan(atr_m3.iloc[i]) else atr_h1.iloc[-1]
+                    atr_val = atr_m3.iloc[i] if i < len(atr_m3) and not np.isnan(atr_m3.iloc[i]) else (atr_h1.iloc[-1] if len(atr_h1) > 0 and not np.isnan(atr_h1.iloc[-1]) else None)
+                    if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
+                        remaining_fvgs.append(fvg)
+                        continue
                     sl = fvg["bottom"] - atr_val * params["sl_atr_multiplier"]
                     risk = close - sl
                     if risk <= 0:
@@ -323,7 +326,10 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
             elif fvg["type"] == "bearish":
                 entry_level = fvg["bottom"] + (fvg["top"] - fvg["bottom"]) * entry_depth
                 if high >= entry_level and close < fvg["top"]:
-                    atr_val = atr_m3.iloc[i] if not np.isnan(atr_m3.iloc[i]) else atr_h1.iloc[-1]
+                    atr_val = atr_m3.iloc[i] if i < len(atr_m3) and not np.isnan(atr_m3.iloc[i]) else (atr_h1.iloc[-1] if len(atr_h1) > 0 and not np.isnan(atr_h1.iloc[-1]) else None)
+                    if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
+                        remaining_fvgs.append(fvg)
+                        continue
                     sl = fvg["top"] + atr_val * params["sl_atr_multiplier"]
                     risk = sl - close
                     if risk <= 0:
