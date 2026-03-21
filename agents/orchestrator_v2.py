@@ -203,6 +203,8 @@ def run(max_iterations=100, skip_data_download=False):
             suggestion = suggest_change(params_backup)
         except Exception as e:
             print(f"  Optimizer error: {e}")
+            save_experiment(i, {"param": f"error: {e}", "old_value": 0, "new_value": 0, "reasoning": str(e)},
+                           {"avg_score": 0, "results": {}}, "error", params_backup)
             continue
 
         # Применяем
@@ -226,6 +228,7 @@ def run(max_iterations=100, skip_data_download=False):
                 new_params = params_backup.copy()
             else:
                 print(f"  [Orchestrator] Code change failed — old_code not found, skipping")
+                save_experiment(i, suggestion, {"avg_score": 0, "results": {}}, "skip_code_fail", params_backup)
                 continue
         else:
             new_params = params_backup.copy()
