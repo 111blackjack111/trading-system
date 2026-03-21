@@ -222,6 +222,14 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
         list of dict: сигналы [{timestamp, direction, entry, sl, tp, fvg}, ...]
     """
     is_crypto = is_crypto_instrument(instrument)
+
+    # Применяем overrides для крипты/форекса
+    params = params.copy()
+    if is_crypto and "crypto_overrides" in params:
+        params.update(params["crypto_overrides"])
+    elif not is_crypto and "forex_overrides" in params:
+        params.update(params["forex_overrides"])
+
     fvg_max_age = params.get("fvg_max_age_bars", 20)
 
     # 1. Определяем тренд на H1

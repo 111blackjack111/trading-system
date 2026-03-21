@@ -229,7 +229,15 @@ def run(max_iterations=100, skip_data_download=False):
                 continue
         else:
             new_params = params_backup.copy()
-            new_params[suggestion["param"]] = suggestion["new_value"]
+            param_name = suggestion["param"]
+            # Поддержка nested params: "crypto_overrides.be_trigger_rr"
+            if "." in param_name:
+                group, key = param_name.split(".", 1)
+                if group not in new_params:
+                    new_params[group] = {}
+                new_params[group][key] = suggestion["new_value"]
+            else:
+                new_params[param_name] = suggestion["new_value"]
             save_params(new_params)
 
         # Backtest (через агента — параллельно)

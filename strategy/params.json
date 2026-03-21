@@ -12,5 +12,18 @@
   "min_atr_percentile": 40,
   "fvg_max_age_bars": 20,
   "news_filter": true,
-  "crypto_hours_filter": true
+  "crypto_hours_filter": true,
+
+  "crypto_overrides": {
+    "be_trigger_rr": 1.0,
+    "sl_atr_multiplier": 1.5,
+    "tp_rr_ratio": 2.0,
+    "min_atr_percentile": 40
+  },
+  "forex_overrides": {
+    "be_trigger_rr": 0.7,
+    "sl_atr_multiplier": 1.5,
+    "tp_rr_ratio": 2.0,
+    "min_atr_percentile": 30
+  }
 }

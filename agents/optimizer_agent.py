@@ -19,6 +19,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "experiments.db")
 STRATEGY_PATH = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_strategy.py")
 
 # Диапазоны параметров для оптимизации
+# Общие параметры (применяются ко всем инструментам)
 PARAM_RANGES = {
     "fvg_min_size_multiplier": (0.1, 1.0),
     "fvg_entry_depth": (0.3, 0.7),
@@ -29,6 +30,15 @@ PARAM_RANGES = {
     "tp_rr_ratio": (1.5, 3.0),
     "min_atr_percentile": (20, 60),
     "fvg_max_age_bars": (5, 50),
+    # Группа-специфичные (crypto_overrides.X, forex_overrides.X)
+    "crypto_overrides.be_trigger_rr": (0.5, 1.5),
+    "crypto_overrides.sl_atr_multiplier": (1.0, 3.0),
+    "crypto_overrides.tp_rr_ratio": (1.5, 3.0),
+    "crypto_overrides.min_atr_percentile": (20, 60),
+    "forex_overrides.be_trigger_rr": (0.3, 1.2),
+    "forex_overrides.sl_atr_multiplier": (1.0, 3.0),
+    "forex_overrides.tp_rr_ratio": (1.5, 3.0),
+    "forex_overrides.min_atr_percentile": (20, 60),
 }
 
 
