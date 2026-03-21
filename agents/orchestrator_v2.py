@@ -239,9 +239,15 @@ def run(max_iterations=100, skip_data_download=False):
         bt_result = wait_for_backtest(request_id)
 
         new_score = bt_result.get("avg_score", 0)
+        total_trades_new = sum(
+            m.get("total_trades", 0)
+            for m in bt_result.get("results", {}).values()
+            if m
+        )
 
         # Keep / Revert
-        if new_score > best_score:
+        # NEVER keep if no trades or score=0 (broken code change)
+        if new_score > best_score and total_trades_new >= 30 and new_score != 0:
             action = "keep"
             improvement = new_score - best_score
             best_score = new_score
