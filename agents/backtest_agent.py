@@ -22,13 +22,22 @@ REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
 
+# Инструменты на которых стратегия работает.
+# Исключены: BNBUSDT (-42R), ETHUSDT (-16R), EUR_USD (-6R), GBP_JPY (WR 0-9%)
+ACTIVE_INSTRUMENTS = {
+    "GER40", "XAU_USD", "USD_JPY", "GBP_USD", "BTCUSDT", "SOLUSDT", "EUR_GBP",
+}
+
+
 def get_instruments():
-    """Определяет инструменты по наличию CSV файлов."""
+    """Определяет инструменты по наличию CSV файлов + whitelist."""
     instruments = set()
     if os.path.exists(CSV_DIR):
         for f in os.listdir(CSV_DIR):
             if f.endswith("_H1.csv"):
-                instruments.add(f.replace("_H1.csv", ""))
+                inst = f.replace("_H1.csv", "")
+                if inst in ACTIVE_INSTRUMENTS:
+                    instruments.add(inst)
     return sorted(instruments)
 
 
