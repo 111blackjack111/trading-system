@@ -28,7 +28,7 @@ DB_PATH = os.path.join(BASE_DIR, "db", "experiments.db")
 CHECK_INTERVAL = 30          # проверяем каждые 30 секунд
 REPORT_EVERY_N = 10          # отчёт каждые N итераций
 STALL_THRESHOLD = 10         # N итераций без улучшения = застрял
-HANG_TIMEOUT = 900           # 15 минут без новых записей = завис
+HANG_TIMEOUT = 1800          # 30 минут без новых записей = завис (baseline ~20 мин)
 
 
 def send_telegram(message):
