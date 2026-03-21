@@ -105,7 +105,7 @@ def calculate_score(sharpe, profit_factor, max_drawdown, winrate, total_trades):
     score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1 - winrate_penalty
     """
     if total_trades < 10:
-        return 0
+        return -999  # Недостаточно сделок — не считать улучшением
 
     # Плавный штраф за низкий WR (вместо бинарного отсечения)
     winrate_penalty = max(0, 0.40 - winrate) * 2.0

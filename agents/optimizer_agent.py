@@ -254,11 +254,15 @@ def suggest_change(params=None):
     trade_log = get_trade_log()
 
     # Определяем режим: параметры или код
+    # 70% param changes, 30% code changes (чтобы не застревать в одном режиме)
+    import random
     avg_wr = compute_avg_winrate(metrics)
-    allow_code_changes = avg_wr < 0.25
+    allow_code_changes = avg_wr < 0.25 and random.random() < 0.3
 
     if allow_code_changes:
-        print("  [Optimizer] CODE CHANGE MODE enabled (WR < 25%)")
+        print("  [Optimizer] CODE CHANGE MODE enabled (WR < 25%, roll=code)")
+    elif avg_wr < 0.25:
+        print("  [Optimizer] PARAM MODE (WR < 25%, roll=param)")
 
     prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes)
 
