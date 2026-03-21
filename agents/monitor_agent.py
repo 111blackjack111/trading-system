@@ -98,6 +98,29 @@ def read_trade_log():
         return None
 
 
+def check_api_health():
+    """Проверяет работает ли Anthropic API."""
+    try:
+        import anthropic
+        api_key = config.ANTHROPIC_API_KEY
+        if not api_key:
+            return False
+        client = anthropic.Anthropic(api_key=api_key)
+        client.messages.create(
+            model="claude-4-sonnet-20250514",
+            max_tokens=5,
+            messages=[{"role": "user", "content": "ping"}],
+        )
+        return True
+    except Exception as e:
+        err = str(e)
+        if "credit" in err.lower() or "limit" in err.lower() or "balance" in err.lower():
+            print(f"[Monitor] API credit/limit error: {err[:100]}")
+            return False
+        # Other errors (network etc) - don't alert
+        return True
+
+
 def check_tmux_session(name):
     """Проверяет, жива ли tmux сессия."""
     try:
@@ -308,6 +331,26 @@ def run():
                         print(f"[Monitor] Report sent for iterations {start}-{end}")
 
                     last_reported_iter = current_iter
+
+            # --- 2.5. Проверка API (раз в 5 минут) ---
+            if not hasattr(run, '_last_api_check'):
+                run._last_api_check = 0
+                run._api_alert_sent = False
+
+            if time.time() - run._last_api_check > 300:
+                run._last_api_check = time.time()
+                api_ok = check_api_health()
+                if not api_ok and not run._api_alert_sent:
+                    send_telegram(
+                        "🔴 <b>API не работает!</b>\n"
+                        "Кредиты закончились или лимит достигнут.\n"
+                        "Оптимизация остановлена.\n\n"
+                        "Действие: пополни кредиты на console.anthropic.com"
+                    )
+                    run._api_alert_sent = True
+                elif api_ok and run._api_alert_sent:
+                    send_telegram("🟢 <b>API восстановлен!</b>\nОптимизация продолжается.")
+                    run._api_alert_sent = False
 
             # --- 3. Проверка стагнации ---
             if len(rows) >= STALL_THRESHOLD:
