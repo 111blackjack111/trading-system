@@ -129,9 +129,10 @@ def fetch_top_symbols(exchange, limit=200):
     sorted_pairs = sorted(usdt_pairs.items(), key=lambda x: x[1]["quoteVolume"], reverse=True)
     symbols = [pair[0] for pair in sorted_pairs[:limit]]
 
-    # Исключаем стейблкоины и leveraged
+    # Исключаем стейблкоины, wrapped и leveraged
     exclude = {"USDC/USDT", "BUSD/USDT", "DAI/USDT", "TUSD/USDT", "FDUSD/USDT",
-               "USD1/USDT", "WBTC/USDT", "STETH/USDT"}
+               "USD1/USDT", "WBTC/USDT", "STETH/USDT", "BFUSD/USDT", "USDD/USDT",
+               "WBETH/USDT", "EETH/USDT"}
     symbols = [s for s in symbols if s not in exclude and "UP/" not in s and "DOWN/" not in s]
     return symbols
 
@@ -776,13 +777,201 @@ def get_stats():
 
 
 # ============================================================
+# v3: Обучение — проверка предсказаний и обновление весов
+# ============================================================
+
+def verify_predictions():
+    """
+    Проверяет алерты старше 7 дней: стрельнула монета или нет.
+    Обновляет result в live_alerts и пересчитывает веса.
+    """
+    if not os.path.exists(DB_PATH):
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    exchange = get_exchange()
+
+    # Найти алерты без результата старше 7 дней
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    unverified = conn.execute("""
+        SELECT * FROM live_alerts
+        WHERE result IS NULL AND alert_date < ?
+    """, (cutoff,)).fetchall()
+
+    if not unverified:
+        print("  No predictions to verify")
+        conn.close()
+        return
+
+    print(f"  Verifying {len(unverified)} predictions...")
+
+    hits = 0
+    misses = 0
+
+    for alert in unverified:
+        symbol = alert["symbol"]
+        alert_price = alert["price_at_alert"]
+        alert_date = alert["alert_date"]
+
+        # Скачиваем данные после алерта
+        try:
+            df = fetch_daily_data(exchange, symbol, days=14)
+            if df is None or len(df) < 7:
+                continue
+
+            # Цена через 7 дней после алерта
+            alert_dt = pd.Timestamp(alert_date)
+            future = df[df.index > alert_dt]
+            if len(future) < 7:
+                continue
+
+            price_7d = float(future.iloc[6]["close"])
+            max_price_7d = float(future.iloc[:7]["high"].max())
+            pct_change = (max_price_7d - alert_price) / alert_price
+
+            if pct_change >= 0.20:  # +20% за 7 дней = hit
+                result = "hit"
+                hits += 1
+            elif pct_change >= 0.05:  # +5-20% = partial
+                result = "partial"
+            else:
+                result = "miss"
+                misses += 1
+
+            conn.execute("""
+                UPDATE live_alerts
+                SET price_after_7d = ?, result = ?
+                WHERE id = ?
+            """, (price_7d, result, alert["id"]))
+
+            print(f"  {symbol}: {result} (alert ${alert_price:.4f} → max ${max_price_7d:.4f}, {pct_change:+.1%})")
+
+        except Exception as e:
+            print(f"  {symbol}: error - {e}")
+            continue
+
+        time.sleep(0.3)
+
+    conn.commit()
+
+    total_verified = hits + misses
+    if total_verified > 0:
+        accuracy = hits / total_verified * 100
+        print(f"\n  Accuracy: {hits}/{total_verified} = {accuracy:.0f}%")
+
+        # Обновляем веса на основе результатов
+        update_weights_from_results(conn)
+
+        # Telegram отчёт
+        send_telegram(
+            f"📊 <b>ImpulseAgent: Проверка предсказаний</b>\n\n"
+            f"Проверено: {len(unverified)} алертов\n"
+            f"✅ Сработало (>20%): {hits}\n"
+            f"❌ Не сработало: {misses}\n"
+            f"Accuracy: {accuracy:.0f}%\n"
+            f"Веса обновлены."
+        )
+
+    conn.close()
+
+
+def update_weights_from_results(conn):
+    """
+    Пересчитывает веса признаков на основе hit/miss.
+    Признаки которые чаще совпадают с hit — получают больший вес.
+    """
+    # Собираем features для hits и misses
+    hits = conn.execute("""
+        SELECT features FROM live_alerts WHERE result = 'hit'
+    """).fetchall()
+    misses = conn.execute("""
+        SELECT features FROM live_alerts WHERE result = 'miss'
+    """).fetchall()
+
+    if not hits and not misses:
+        return
+
+    feature_names = [
+        "volume_spike", "price_compression", "rsi", "volume_trend",
+        "near_support", "low_volatility", "accumulation", "range_breakout",
+        "increasing_lows", "btc_correlation"
+    ]
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    for fn in feature_names:
+        hit_vals = []
+        miss_vals = []
+
+        for h in hits:
+            f = json.loads(h["features"])
+            if fn in f and isinstance(f[fn], (int, float)):
+                hit_vals.append(f[fn])
+
+        for m in misses:
+            f = json.loads(m["features"])
+            if fn in f and isinstance(f[fn], (int, float)):
+                miss_vals.append(f[fn])
+
+        avg_hit = np.mean(hit_vals) if hit_vals else 0
+        avg_miss = np.mean(miss_vals) if miss_vals else 0
+
+        # Predictive power = насколько отличаются hit vs miss
+        diff = abs(avg_hit - avg_miss)
+        combined_std = np.std(hit_vals + miss_vals) if (hit_vals or miss_vals) else 1
+        power = round(diff / (combined_std + 1e-10), 4)
+
+        conn.execute("""
+            INSERT OR REPLACE INTO pattern_weights
+            (feature, weight, avg_when_impulse, avg_when_no_impulse, predictive_power, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (fn, power, round(avg_hit, 4), round(avg_miss, 4), power, now))
+
+    conn.commit()
+    print("  Pattern weights updated from prediction results")
+
+
+def run_loop():
+    """
+    Полный цикл обучения — запускается каждый час:
+    1. Проверяет предсказания старше 7 дней
+    2. Мониторит текущий рынок
+    3. Повторяет
+    """
+    print("=" * 60)
+    print("ImpulseAgent v3: Learning loop")
+    print("  Verify predictions + Monitor + Update weights")
+    print("  Cycle: every 1 hour")
+    print("=" * 60)
+
+    while True:
+        try:
+            print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M')}] Cycle start")
+
+            # 1. Проверяем старые предсказания
+            print("  Step 1: Verify predictions...")
+            verify_predictions()
+
+            # 2. Мониторим текущий рынок
+            print("  Step 2: Monitor live...")
+            monitor_live()
+
+            print(f"  Cycle complete. Sleeping 1 hour...")
+        except Exception as e:
+            print(f"  Error in cycle: {e}")
+
+        time.sleep(3600)
+
+
+# ============================================================
 # Main
 # ============================================================
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["scan", "analyze", "monitor", "stats", "full"], default="full")
+    parser.add_argument("--mode", choices=["scan", "analyze", "monitor", "verify", "loop", "stats", "full"], default="full")
     parser.add_argument("--days", type=int, default=SCAN_DAYS)
     args = parser.parse_args()
 
@@ -792,15 +981,19 @@ if __name__ == "__main__":
         analyze_patterns()
     elif args.mode == "monitor":
         monitor_live()
+    elif args.mode == "verify":
+        verify_predictions()
+    elif args.mode == "loop":
+        run_loop()
     elif args.mode == "stats":
         get_stats()
     elif args.mode == "full":
-        # Полный цикл: скан → анализ → мониторинг
+        # Полный цикл: скан → анализ → мониторинг → loop
         print("=" * 60)
-        print("ImpulseAgent v2: Full cycle (2 years, 200 coins)")
+        print("ImpulseAgent v3: Full cycle (2 years, 200 coins)")
         print("=" * 60)
         scan_historical(days=args.days)
         print("\n" + "=" * 60)
-        print("Live monitoring...")
+        print("Switching to learning loop...")
         print("=" * 60)
-        monitor_live()
+        run_loop()
