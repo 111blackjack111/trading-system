@@ -212,15 +212,68 @@ def run_analysis(consecutive_reverts=0, blacklist_info="none"):
     print(f"[Analyst] Trend: {report.get('trend', 'N/A')}")
     print(f"[Analyst] Recommendations: {len(report.get('recommendations', []))}")
 
-    # Telegram summary
-    summary = report.get("summary", "Analysis complete")
+    # Full Telegram report
     trend_emoji = {"improving": "📈", "stuck": "⚠️", "degrading": "📉"}.get(report.get("trend"), "🔍")
-    send_telegram(
-        f"{trend_emoji} <b>Analyst Report</b>\n\n"
-        f"{summary}\n\n"
-        f"Trend: {report.get('trend', 'unknown')}\n"
-        f"Рекомендаций: {len(report.get('recommendations', []))}"
+
+    # Build instrument stats
+    inst_lines = []
+    for inst, data in sorted(trade_log.get("win_by_instrument", {}).items(), key=lambda x: -x[1].get("total_r", 0)):
+        wr = data.get("winrate", 0)
+        total_r = data.get("total_r", 0)
+        trades = data.get("total_trades", 0)
+        emoji = "✅" if total_r > 0 else "❌"
+        inst_lines.append(f"  {emoji} {inst}: WR {wr:.0%}, {total_r:+.0f}R ({trades})")
+
+    # Build keeps info
+    keeps_count = len(keeps)
+    reverts_in_last10 = sum(1 for e in experiments if e.get("action") == "revert")
+    keeps_in_last10 = sum(1 for e in experiments if e.get("action") == "keep")
+
+    # Best score from keeps
+    best_keep = keeps[0] if keeps else {}
+    best_param = best_keep.get("param_changed", "N/A")
+    best_wr = trade_log.get("overall_winrate", 0)
+
+    # Exit breakdown
+    exits = trade_log.get("exit_reason_breakdown", {})
+    exit_lines = []
+    total_trades = trade_log.get("total_trades", 1)
+    for reason, data in exits.items():
+        pct = data.get("count", 0) / total_trades * 100
+        exit_lines.append(f"  {reason}: {pct:.0f}%")
+
+    # Recommendations
+    rec_lines = []
+    for r in report.get("recommendations", []):
+        conf = r.get("confidence", 0)
+        conf_emoji = "🟢" if conf >= 0.8 else "🟡" if conf >= 0.5 else "🔴"
+        status = "авто" if conf >= 0.8 else "ждёт CEO"
+        rec_lines.append(f"  {conf_emoji} {r.get('action')}: {r.get('target')} ({status})")
+
+    msg = (
+        f"🧠 <b>Orchestrator Decision</b>\n"
+        f"\n"
+        f"📊 Проанализировано {len(experiments)} итераций\n"
+        f"🏆 Лучший: score={best_keep.get('avg_score', 0):.2f} "
+        f"(WR={best_wr:.1%}, {total_trades} trades)\n"
+        f"\n"
+        f"{trend_emoji} <b>Статус:</b> {report.get('trend', 'unknown')}\n"
+        f"✅ Keep: {keeps_in_last10} | ❌ Revert: {reverts_in_last10}\n"
+        f"\n"
+        f"📈 <b>По инструментам:</b>\n"
+        f"{chr(10).join(inst_lines)}\n"
+        f"\n"
+        f"🎯 <b>Выходы:</b> {' | '.join(exit_lines)}\n"
+        f"\n"
+        f"💡 <b>Диагноз:</b>\n"
+        f"{report.get('diagnosis', 'N/A')}\n"
+        f"\n"
+        f"🚀 <b>Рекомендации:</b>\n"
+        f"{chr(10).join(rec_lines) if rec_lines else '  Нет'}\n"
+        f"\n"
+        f"🎯 {report.get('summary', '')}"
     )
+    send_telegram(msg)
 
     return report
 
