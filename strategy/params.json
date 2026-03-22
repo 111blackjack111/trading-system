@@ -20,7 +20,7 @@
     "min_atr_percentile": 50
   },
   "forex_overrides": {
-    "be_trigger_rr": 1.0,
+    "be_trigger_rr": 1.3,
     "sl_atr_multiplier": 1.5,
     "tp_rr_ratio": 2.0,
     "min_atr_percentile": 45
