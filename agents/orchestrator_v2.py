@@ -118,6 +118,54 @@ def is_anomaly(new_score, best_score, new_wr, baseline_wr):
 
 
 # ============================================================
+# Snapshot — сохранение/восстановление params перед рискованными изменениями
+# ============================================================
+
+SNAPSHOT_PATH = os.path.join(RUNTIME_DIR, "params_snapshot.json")
+SNAPSHOT_SCORE_PATH = os.path.join(RUNTIME_DIR, "snapshot_score.json")
+
+
+def save_snapshot(params, score):
+    """Сохраняет snapshot params перед рекомендациями AnalystAgent."""
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    with open(SNAPSHOT_PATH, "w") as f:
+        json.dump(params, f, indent=2)
+    with open(SNAPSHOT_SCORE_PATH, "w") as f:
+        json.dump({"score": score, "timestamp": time.time()}, f)
+    print(f"  [Snapshot] Saved (score: {score:.4f})")
+
+
+def restore_snapshot():
+    """Восстанавливает params из snapshot."""
+    if not os.path.exists(SNAPSHOT_PATH):
+        return None, None
+    with open(SNAPSHOT_PATH) as f:
+        params = json.load(f)
+    score = 0
+    if os.path.exists(SNAPSHOT_SCORE_PATH):
+        with open(SNAPSHOT_SCORE_PATH) as f:
+            score = json.load(f).get("score", 0)
+    save_params(params)
+    print(f"  [Snapshot] Restored (score: {score:.4f})")
+    return params, score
+
+
+def check_degradation(current_score, iterations_since_analyst):
+    """Проверяет деградацию после рекомендаций AnalystAgent (через 3 итерации)."""
+    if iterations_since_analyst != 3:
+        return False
+    if not os.path.exists(SNAPSHOT_SCORE_PATH):
+        return False
+    with open(SNAPSHOT_SCORE_PATH) as f:
+        snapshot_score = json.load(f).get("score", 0)
+    if snapshot_score <= 0:
+        return False
+    if current_score < snapshot_score * 0.8:
+        return True  # деградация > 20%
+    return False
+
+
+# ============================================================
 # DB & File operations
 # ============================================================
 
@@ -269,6 +317,7 @@ def run(max_iterations=100, skip_data_download=False):
     no_improvement_count = 0
     consecutive_reverts = 0
     ranges_expanded = False
+    run._analyst_iter = -100  # sentinel
 
     # Шаг 2: Итерации
     for i in range(1, max_iterations + 1):
@@ -398,19 +447,55 @@ def run(max_iterations=100, skip_data_download=False):
         if no_improvement_count >= 20:
             print(f"\n  WARNING: {no_improvement_count} iterations without improvement!")
 
+        # === DEGRADATION CHECK (3 итерации после AnalystAgent) ===
+        if hasattr(run, '_analyst_iter') and i - run._analyst_iter == 3:
+            if check_degradation(best_score, 3):
+                old_score = best_score
+                params_restored, snap_score = restore_snapshot()
+                if params_restored:
+                    best_score = snap_score
+                    send_telegram(
+                        f"🔄 <b>Автооткат!</b>\n"
+                        f"Рекомендации AnalystAgent ухудшили систему\n"
+                        f"Score: {snap_score:.2f} → {old_score:.2f} (деградация > 20%)\n"
+                        f"Восстановлены params из snapshot"
+                    )
+                    print(f"  [Degradation] Auto-rollback! Score {old_score:.4f} → restored {snap_score:.4f}")
+                    consecutive_reverts = 0
+
         # === ANALYST AGENT (каждые 10 итераций) ===
         if i % 10 == 0:
             print(f"\n  [Analyst] Running meta-analysis (every 10 iterations)...")
             try:
+                # SNAPSHOT перед любыми изменениями
+                save_snapshot(load_params(), best_score)
+                run._analyst_iter = i
+
                 bl_info = ", ".join(f"{p}(until iter {v})" for p, v in blacklist.cooldown.items()) or "none"
                 report = run_analysis(consecutive_reverts, bl_info)
                 if report:
-                    applied = apply_recommendations(report, PARAM_RANGES)
-                    if applied:
-                        print(f"  [Analyst] Applied: {applied}")
-                        # Reset stuck detector if analyst made changes
-                        if ranges_expanded and any("Range" in a for a in applied):
-                            ranges_expanded = False
+                    # Применяем ТОЛЬКО ОДНУ рекомендацию за раз (не все сразу)
+                    recs = report.get("recommendations", [])
+                    auto_recs = [r for r in recs if r.get("confidence", 0) >= 0.8]
+                    ceo_recs = [r for r in recs if r.get("confidence", 0) < 0.8]
+
+                    if auto_recs:
+                        # Применяем только первую авто-рекомендацию
+                        applied = apply_recommendations({"recommendations": auto_recs[:1]}, PARAM_RANGES)
+                        if applied:
+                            print(f"  [Analyst] Applied ONE rec: {applied}")
+                            if ranges_expanded and any("Range" in a for a in applied):
+                                ranges_expanded = False
+
+                    if ceo_recs:
+                        # Остальные — в Telegram для CEO
+                        for r in ceo_recs:
+                            send_telegram(
+                                f"🔍 Analyst рекомендует (confidence: {r.get('confidence', 0):.0%})\n"
+                                f"{r.get('type', 'unknown')}: {r.get('description', 'N/A')}\n"
+                                f"{r.get('reasoning', '')}\n"
+                                f"Применить? Ответь в чате с Claude Code"
+                            )
             except Exception as e:
                 print(f"  [Analyst] Error: {e}")
 
