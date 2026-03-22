@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from strategy.base_strategy import load_params, save_params
 from agents.optimizer_agent import suggest_change, PARAM_RANGES
+from agents.analyst_agent import run_analysis, apply_recommendations
 from agents.data_agent import run as run_data_agent
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
@@ -395,6 +396,22 @@ def run(max_iterations=100, skip_data_download=False):
 
         if no_improvement_count >= 20:
             print(f"\n  WARNING: {no_improvement_count} iterations without improvement!")
+
+        # === ANALYST AGENT (каждые 10 итераций) ===
+        if i % 10 == 0:
+            print(f"\n  [Analyst] Running meta-analysis (every 10 iterations)...")
+            try:
+                bl_info = ", ".join(f"{p}(until iter {v})" for p, v in blacklist.cooldown.items()) or "none"
+                report = run_analysis(consecutive_reverts, bl_info)
+                if report:
+                    applied = apply_recommendations(report, PARAM_RANGES)
+                    if applied:
+                        print(f"  [Analyst] Applied: {applied}")
+                        # Reset stuck detector if analyst made changes
+                        if ranges_expanded and any("Range" in a for a in applied):
+                            ranges_expanded = False
+            except Exception as e:
+                print(f"  [Analyst] Error: {e}")
 
     # Финал
     print(f"\n{'=' * 60}")
