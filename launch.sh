@@ -1,12 +1,11 @@
 #!/bin/bash
 # Запуск всех агентов в отдельных TMUX сессиях
 # Usage: ./launch.sh [iterations]
+# OptimizerAgent работает через Claude CLI (подписка Max, $0)
 
 ITERATIONS=${1:-100}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$DIR/venv/bin/activate"
-
-export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"
 
 echo "=== Trading System Launch ==="
 echo "Directory: $DIR"
@@ -22,17 +21,15 @@ tmux kill-session -t monitor 2>/dev/null
 echo "Starting BacktestAgent..."
 tmux new-session -d -s backtest "
 cd $DIR && source $VENV
-export ANTHROPIC_API_KEY='$ANTHROPIC_API_KEY'
 python3 agents/backtest_agent.py --mode watch
 "
 
 sleep 2
 
-# 2. OrchestratorAgent — главный цикл, общается с BacktestAgent через файлы
+# 2. OrchestratorAgent — главный цикл, OptimizerAgent вызывает Claude CLI
 echo "Starting Orchestrator v2..."
 tmux new-session -d -s orchestrator "
 cd $DIR && source $VENV
-export ANTHROPIC_API_KEY='$ANTHROPIC_API_KEY'
 python3 agents/orchestrator_v2.py --iterations $ITERATIONS --skip-data 2>&1 | tee results/orchestrator.log
 "
 
@@ -40,11 +37,12 @@ python3 agents/orchestrator_v2.py --iterations $ITERATIONS --skip-data 2>&1 | te
 echo "Starting ImpulseAgent..."
 tmux new-session -d -s impulse "
 cd $DIR && source $VENV
-echo 'ImpulseAgent: Scanning historical impulses...'
-python3 agents/impulse_agent.py --mode scan --days 180 2>&1 | tee results/impulse.log
-echo '---'
-echo 'ImpulseAgent: Switching to live monitoring...'
-python3 agents/impulse_agent.py --mode live 2>&1 | tee -a results/impulse.log
+while true; do
+  echo \"[ImpulseAgent] Scan started at \$(date)\"
+  python3 agents/impulse_agent.py --mode scan --days 7 2>&1 | tee -a results/impulse.log
+  echo \"[ImpulseAgent] Sleeping 1 hour...\"
+  sleep 3600
+done
 "
 
 # 4. MonitorAgent — следит за здоровьем, шлёт Telegram отчёты

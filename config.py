@@ -5,8 +5,8 @@ OANDA_API_KEY = os.environ.get("OANDA_API_KEY")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID")
 OANDA_ENV = "practice"  # practice = demo, live = real
 
-# Anthropic (OptimizerAgent)
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+# Anthropic API больше не используется.
+# OptimizerAgent работает через Claude CLI (подписка Max).
 
 # Binance (Crypto) - public данные работают без ключей
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY")
