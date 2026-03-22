@@ -265,16 +265,20 @@ def suggest_change(params=None):
     prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes)
 
     # Вызываем Claude CLI через подписку Max (бесплатно)
+    # Передаём промпт через stdin чтобы избежать лимита длины аргументов
     result = subprocess.run(
-        ["claude", "-p", prompt, "--output-format", "text"],
-        capture_output=True, text=True, timeout=120,
+        ["claude", "-p", "--output-format", "text"],
+        input=prompt,
+        capture_output=True, text=True, timeout=180,
         cwd=os.path.join(os.path.dirname(__file__), ".."),
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Claude CLI error: {result.stderr[:200]}")
+        raise RuntimeError(f"Claude CLI error (rc={result.returncode}): {result.stderr[:500]}")
 
     text = result.stdout.strip()
+    if not text:
+        raise RuntimeError(f"Claude CLI returned empty response. stderr: {result.stderr[:500]}")
 
     # Извлекаем JSON если обёрнут в markdown
     if "```json" in text:
