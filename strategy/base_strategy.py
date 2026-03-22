@@ -316,6 +316,12 @@ def is_after_close(timestamp):
     return t >= dtime(19, 0)
 
 
+def is_asian_session(timestamp):
+    """Asian session: 00:00-06:00 UTC (03:00-09:00 UTC+3). Worst WR for forex."""
+    t = timestamp.time() if hasattr(timestamp, "time") else timestamp
+    return t < dtime(6, 0)
+
+
 # ============================================================
 # Генератор сигналов
 # ============================================================
@@ -425,6 +431,9 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
         # Фильтры времени — для крипты отключены
         if not is_crypto:
             if is_monday_opening(ts):
+                continue
+            # Asian session filter (WR 20-24% на форексе — убыточно)
+            if params.get("asian_filter_forex", False) and is_asian_session(ts):
                 continue
             if is_after_close(ts):
                 continue
