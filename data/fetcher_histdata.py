@@ -1,6 +1,6 @@
 """
-Fetcher для исторических форекс данных через histdata.com.
-Скачивает M1 свечи и агрегирует в M3 и H1.
+Fetcher для исторических форекс данных через histdata.com (pip install histdata).
+Скачивает M1 свечи за полные годы и агрегирует в M3 и H1.
 
 Бесплатно, без API ключей, до 15 лет истории.
 """
@@ -8,79 +8,117 @@ Fetcher для исторических форекс данных через his
 import os
 import io
 import zipfile
+import tempfile
 import pandas as pd
-import urllib.request
 from datetime import datetime
 
 CSV_DIR = os.path.join(os.path.dirname(__file__), "csv")
 
 # Маппинг наших инструментов → histdata тикеры
 INSTRUMENT_MAP = {
-    "GBP_USD": "GBPUSD",
-    "EUR_GBP": "EURGBP",
-    "USD_JPY": "USDJPY",
-    "EUR_USD": "EURUSD",
-    "GBP_JPY": "GBPJPY",
-    "XAU_USD": "XAUUSD",
+    "GBP_USD": "gbpusd",
+    "EUR_GBP": "eurgbp",
+    "USD_JPY": "usdjpy",
+    "EUR_USD": "eurusd",
+    "GBP_JPY": "gbpjpy",
+    "XAU_USD": "xauusd",
 }
 
-# GER40 (DAX) нет на histdata — оставим Yahoo для него
 
+def download_year(pair_histdata, year):
+    """Скачивает M1 данные за год через histdata пакет."""
+    from histdata import download_hist_data
+    from histdata.api import Platform, TimeFrame
 
-def download_histdata_month(pair, year, month):
-    """
-    Скачивает M1 данные за один месяц с histdata.com.
-    Returns: DataFrame или None
-    """
-    # histdata URL format
-    url = (
-        f"https://www.histdata.com/download-free-forex-data/"
-        f"?/ascii/1-minute-bar-quotes/{pair.lower()}/{year}/{month}"
-    )
-
-    # histdata требует POST запрос для скачивания
-    # Используем альтернативный источник: github.com/philipperemy/FX-1-Minute-Data
-    # Этот репозиторий содержит уже скачанные данные histdata в CSV формате
-    github_url = (
-        f"https://raw.githubusercontent.com/philipperemy/FX-1-Minute-Data/"
-        f"master/data/{pair}/{year}/{month}.csv"
-    )
-
-    try:
-        req = urllib.request.Request(github_url)
-        req.add_header("User-Agent", "Mozilla/5.0")
-        response = urllib.request.urlopen(req, timeout=30)
-        data = response.read().decode("utf-8")
-
-        # Parse CSV — format: timestamp,open,high,low,close,volume
-        df = pd.read_csv(
-            io.StringIO(data),
-            names=["timestamp", "open", "high", "low", "close", "volume"],
-            parse_dates=["timestamp"],
-        )
-        df.set_index("timestamp", inplace=True)
-        return df
-    except Exception as e:
-        # Try alternative format (some files have different structure)
+    with tempfile.TemporaryDirectory() as tmp:
         try:
+            result = download_hist_data(
+                year=str(year),
+                pair=pair_histdata,
+                platform=Platform.META_TRADER,
+                time_frame=TimeFrame.ONE_MINUTE,
+                output_directory=tmp,
+            )
+        except Exception as e:
+            print(f"    Download error for {pair_histdata} {year}: {e}")
+            return None
+
+        if not result or not os.path.exists(result):
+            return None
+
+        # Unzip and parse CSV
+        with zipfile.ZipFile(result) as z:
+            csv_files = [n for n in z.namelist() if n.endswith(".csv")]
+            if not csv_files:
+                return None
+
+            with z.open(csv_files[0]) as f:
+                content = f.read().decode("utf-8")
+
+        # Parse: format is "2024.01.01,17:00,1.271840,1.271840,1.271840,1.271840,0"
+        df = pd.read_csv(
+            io.StringIO(content),
+            header=None,
+            names=["date", "time", "open", "high", "low", "close", "volume"],
+        )
+        df["timestamp"] = pd.to_datetime(df["date"] + " " + df["time"], format="%Y.%m.%d %H:%M")
+        df.set_index("timestamp", inplace=True)
+        df.drop(["date", "time"], axis=1, inplace=True)
+        df = df.astype(float)
+
+        return df
+
+
+def download_current_year_months(pair_histdata):
+    """Скачивает текущий год помесячно."""
+    from histdata import download_hist_data
+    from histdata.api import Platform, TimeFrame
+
+    now = datetime.now()
+    all_data = []
+
+    for month in range(1, now.month + 1):
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                result = download_hist_data(
+                    year=str(now.year),
+                    month=str(month),
+                    pair=pair_histdata,
+                    platform=Platform.META_TRADER,
+                    time_frame=TimeFrame.ONE_MINUTE,
+                    output_directory=tmp,
+                )
+            except Exception as e:
+                print(f"    Month {month}: {e}")
+                continue
+
+            if not result or not os.path.exists(result):
+                continue
+
+            with zipfile.ZipFile(result) as z:
+                csv_files = [n for n in z.namelist() if n.endswith(".csv")]
+                if not csv_files:
+                    continue
+                with z.open(csv_files[0]) as f:
+                    content = f.read().decode("utf-8")
+
             df = pd.read_csv(
-                io.StringIO(data),
-                sep=";",
+                io.StringIO(content),
+                header=None,
                 names=["date", "time", "open", "high", "low", "close", "volume"],
             )
-            df["timestamp"] = pd.to_datetime(df["date"] + " " + df["time"])
+            df["timestamp"] = pd.to_datetime(df["date"] + " " + df["time"], format="%Y.%m.%d %H:%M")
             df.set_index("timestamp", inplace=True)
             df.drop(["date", "time"], axis=1, inplace=True)
-            return df
-        except Exception:
-            print(f"    Failed to download {pair} {year}/{month}: {e}")
-            return None
+            df = df.astype(float)
+            all_data.append(df)
+            print(f"    Month {month}: {len(df)} candles")
+
+    return pd.concat(all_data) if all_data else None
 
 
 def download_pair(instrument, months=12):
-    """
-    Скачивает M1 данные для инструмента и агрегирует в M3 и H1.
-    """
+    """Скачивает M1 данные и агрегирует в M3 и H1."""
     pair = INSTRUMENT_MAP.get(instrument)
     if not pair:
         print(f"  {instrument}: not in histdata map, skipping")
@@ -91,25 +129,39 @@ def download_pair(instrument, months=12):
     now = datetime.now()
     all_data = []
 
+    # Previous year(s)
+    years_needed = set()
     for i in range(months):
-        # Go back i months
-        month_offset = now.month - i - 1
-        year = now.year + (month_offset // 12)
-        month = (month_offset % 12) + 1
+        dt = datetime(now.year, now.month, 1)
+        month_back = now.month - i - 1
+        y = now.year + (month_back // 12)
+        years_needed.add(y)
 
-        print(f"    Fetching {year}/{month:02d}...")
-        df = download_histdata_month(pair, year, month)
-        if df is not None and len(df) > 0:
-            all_data.append(df)
+    for year in sorted(years_needed):
+        if year < now.year:
+            print(f"    Downloading {year} (full year)...")
+            df = download_year(pair, year)
+            if df is not None:
+                all_data.append(df)
+                print(f"    {year}: {len(df)} M1 candles")
+        else:
+            print(f"    Downloading {year} (current year, by month)...")
+            df = download_current_year_months(pair)
+            if df is not None:
+                all_data.append(df)
 
     if not all_data:
-        print(f"  {instrument}: no data downloaded, trying yfinance fallback")
+        print(f"  {instrument}: no data downloaded")
         return False
 
-    # Combine all months
+    # Combine
     df_m1 = pd.concat(all_data)
     df_m1.sort_index(inplace=True)
     df_m1 = df_m1[~df_m1.index.duplicated(keep="first")]
+
+    # Keep only last N months
+    cutoff = pd.Timestamp.now() - pd.DateOffset(months=months)
+    df_m1 = df_m1[df_m1.index >= cutoff]
 
     print(f"    Total M1 candles: {len(df_m1)}")
 
@@ -133,12 +185,8 @@ def download_pair(instrument, months=12):
 
     # Save
     os.makedirs(CSV_DIR, exist_ok=True)
-
-    m3_path = os.path.join(CSV_DIR, f"{instrument}_M3.csv")
-    h1_path = os.path.join(CSV_DIR, f"{instrument}_H1.csv")
-
-    df_m3.to_csv(m3_path)
-    df_h1.to_csv(h1_path)
+    df_m3.to_csv(os.path.join(CSV_DIR, f"{instrument}_M3.csv"))
+    df_h1.to_csv(os.path.join(CSV_DIR, f"{instrument}_H1.csv"))
 
     print(f"    Saved: M3={len(df_m3)} candles, H1={len(df_h1)} candles")
     return True
