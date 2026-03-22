@@ -25,10 +25,10 @@ DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 # Инструменты на которых стратегия работает.
 # Исключены: BNBUSDT (-42R), ETHUSDT (-16R), EUR_USD (-6R), GBP_JPY (WR 0-9%)
 # Cycle 4: убраны XAU_USD (WR 7.7%, -5R), SOLUSDT (-20R, WR 19.5%)
-# Cycle 4.2: убран GBP_USD (-11R, WR 23%) по рекомендации AnalystAgent
-# Cycle 4.3: убран GER40 (10 сделок за год, 4k свечей — статистически незначимо)
+# GER40 убран (10 сделок за год — статистически незначимо)
+# GBP/USD возвращён — AnalystAgent ошибочно убрал
 ACTIVE_INSTRUMENTS = {
-    "USD_JPY", "BTCUSDT", "EUR_GBP",
+    "USD_JPY", "BTCUSDT", "EUR_GBP", "GBP_USD",
 }
 
 
