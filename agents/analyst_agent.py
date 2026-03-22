@@ -159,6 +159,10 @@ Rules:
 - Be specific: "expand be_trigger_rr to (0.5, 2.5)" not "try wider ranges"
 - If system is improving — say so, don't change what works
 - If stuck — identify the bottleneck and propose a concrete fix
+- IMPORTANT: Write "diagnosis" and "summary" fields in RUSSIAN (Cyrillic). CEO reads Telegram in Russian.
+  Example: "diagnosis": "Система улучшается — score вырос с 0.33 до 1.59 за счёт forex overrides."
+  Example: "summary": "Score растёт. Рекомендую убрать USD/JPY и расширить BE для форекса."
+- "expected_impact" and "details" can stay in English
 """
 
 
