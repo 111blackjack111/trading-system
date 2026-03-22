@@ -132,6 +132,46 @@ def compute_avg_winrate(metrics):
     return sum(winrates) / len(winrates) if winrates else 0
 
 
+def compute_param_priority(history):
+    """Вычисляет приоритет параметров по историческому impact."""
+    if not history:
+        return "No history yet — explore freely."
+
+    # Собираем impact по параметрам из top_5 keeps
+    param_impact = {}
+    for exp in history.get("top_5", []):
+        param = exp.get("param_changed", "")
+        score = exp.get("avg_score", 0)
+        action = exp.get("action", "")
+        if action == "keep" and param and param != "baseline":
+            if param not in param_impact or score > param_impact[param]:
+                param_impact[param] = score
+
+    # Считаем reverts из last_3
+    recent_reverts = set()
+    for exp in history.get("last_3", []):
+        if exp.get("action") == "revert":
+            recent_reverts.add(exp.get("param_changed", ""))
+
+    if not param_impact:
+        return "No keeps yet — explore: be_trigger_rr, bos_swing_length, fvg_entry_depth"
+
+    # Сортируем по impact
+    sorted_params = sorted(param_impact.items(), key=lambda x: -x[1])
+    lines = []
+    for i, (param, score) in enumerate(sorted_params, 1):
+        status = "⚠️ recently reverted" if param in recent_reverts else "✅ available"
+        lines.append(f"{i}. {param} (best score: {score:.2f}) — {status}")
+
+    # Добавляем неисследованные
+    explored = set(param_impact.keys())
+    unexplored = [p for p in PARAM_RANGES if p not in explored]
+    if unexplored:
+        lines.append(f"\nUnexplored parameters: {', '.join(unexplored[:5])}")
+
+    return "\n".join(lines)
+
+
 def build_prompt(params, history, metrics, trade_log, allow_code_changes=False):
     """Строит промпт для Claude."""
 
@@ -225,16 +265,19 @@ Your job is to improve an SMC (Smart Money Concepts) trading strategy.
 {json.dumps(history.get("last_3", []), indent=2) if history else "None yet"}
 
 ## Score Formula
-score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1
-Smooth penalties for: winrate < 0.40, drawdown > 0.10, trades < 30
+score = sharpe * 0.35 + (winrate * profit_factor) * 0.35 - max_drawdown * 0.2 + 0.1
 {code_change_section}
+## Parameter Priority (by historical impact — start with highest)
+{compute_param_priority(history)}
+
 ## Rules
-1. Analyze the trade_log data carefully — find PATTERNS in losses
-2. If suggesting a parameter change: stay within allowed ranges
-3. Consider what worked and what didn't in history
-4. If many recent changes were reverted, try a DIFFERENT approach
+1. START with highest-priority parameters that haven't been exhausted
+2. Analyze the trade_log data — find PATTERNS in losses
+3. Stay within allowed ranges
+4. If a parameter was reverted 2+ times — SKIP IT, try something else
 5. Think about WHY a change might help based on SMC logic
-6. Look at which sessions/instruments perform worst — target those
+6. Try crypto_overrides and forex_overrides separately — they behave differently
+7. Small steps (10-20% change) are better than large jumps
 
 ## Response Format (JSON only)
 For parameter changes:
