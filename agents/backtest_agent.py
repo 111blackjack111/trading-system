@@ -26,8 +26,9 @@ DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 # Исключены: BNBUSDT (-42R), ETHUSDT (-16R), EUR_USD (-6R), GBP_JPY (WR 0-9%)
 # Cycle 4: убраны XAU_USD (WR 7.7%, -5R), SOLUSDT (-20R, WR 19.5%)
 # Cycle 4.2: убран GBP_USD (-11R, WR 23%) по рекомендации AnalystAgent
+# Cycle 4.3: убран GER40 (10 сделок за год, 4k свечей — статистически незначимо)
 ACTIVE_INSTRUMENTS = {
-    "GER40", "USD_JPY", "BTCUSDT", "EUR_GBP",
+    "USD_JPY", "BTCUSDT", "EUR_GBP",
 }
 
 
@@ -62,12 +63,12 @@ def reload_strategy():
     print("  [BacktestAgent] Strategy modules reloaded")
 
 
-def run_parallel_backtest(params, force_reload=False):
-    """Запускает бэктест по всем инструментам параллельно."""
+def run_parallel_backtest(params, force_reload=False, instruments_override=None):
+    """Запускает бэктест по инструментам параллельно."""
     if force_reload:
         reload_strategy()
 
-    instruments = get_instruments()
+    instruments = instruments_override if instruments_override else get_instruments()
     if not instruments:
         print("  [BacktestAgent] No instruments found")
         return {}
@@ -245,10 +246,28 @@ def generate_trade_log(results):
     return trade_log
 
 
+CRYPTO_INSTRUMENTS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
+FOREX_INSTRUMENTS = {"USD_JPY", "EUR_GBP", "GBP_USD", "GER40", "XAU_USD", "EUR_USD", "GBP_JPY"}
+
+# Кеш последних результатов для частичного пересчёта
+_result_cache = {}
+
+
+def detect_changed_group(request):
+    """Определяет какую группу пересчитывать по changed_param."""
+    param = request.get("changed_param", "")
+    if param.startswith("crypto_overrides."):
+        return "crypto"
+    elif param.startswith("forex_overrides."):
+        return "forex"
+    return "all"  # общий параметр — пересчитать всё
+
+
 def watch():
     """Режим наблюдателя — ждёт запросы на бэктест."""
+    global _result_cache
     os.makedirs(RUNTIME_DIR, exist_ok=True)
-    print("[BacktestAgent] Watching for requests...")
+    print("[BacktestAgent] Watching for requests (with smart cache)...")
 
     while True:
         if os.path.exists(REQUEST_FILE):
@@ -258,13 +277,35 @@ def watch():
 
                 params = request.get("params", {})
                 request_id = request.get("id", "unknown")
-                print(f"\n[BacktestAgent] Request #{request_id} received")
+                changed_group = detect_changed_group(request)
+                print(f"\n[BacktestAgent] Request #{request_id} received (group: {changed_group})")
 
                 # Удаляем запрос
                 os.remove(REQUEST_FILE)
 
-                # Запускаем параллельный бэктест (reload при code changes)
-                results = run_parallel_backtest(params, force_reload=True)
+                # Определяем какие инструменты пересчитывать
+                if changed_group == "all" or not _result_cache:
+                    # Пересчитать всё
+                    results = run_parallel_backtest(params, force_reload=True)
+                    _result_cache = dict(results)
+                else:
+                    # Частичный пересчёт — только затронутая группа
+                    active = get_instruments()
+                    if changed_group == "crypto":
+                        recalc = [i for i in active if i in CRYPTO_INSTRUMENTS]
+                        keep = [i for i in active if i not in CRYPTO_INSTRUMENTS]
+                    else:
+                        recalc = [i for i in active if i in FOREX_INSTRUMENTS]
+                        keep = [i for i in active if i not in FOREX_INSTRUMENTS]
+
+                    print(f"  [Cache] Recalc: {recalc}, Cached: {keep}")
+                    # Пересчитываем только нужные
+                    partial = run_parallel_backtest(params, force_reload=True, instruments_override=recalc)
+                    # Мержим с кешем
+                    results = {i: _result_cache[i] for i in keep if i in _result_cache}
+                    results.update(partial)
+                    _result_cache = dict(results)
+
                 save_metrics(results)
                 generate_trade_log(results)
 

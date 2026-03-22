@@ -147,14 +147,15 @@ def init_db():
     conn.close()
 
 
-def request_backtest(params, request_id):
+def request_backtest(params, request_id, changed_param=""):
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     if os.path.exists(DONE_FILE):
         os.remove(DONE_FILE)
-    request = {"id": request_id, "params": params, "timestamp": time.time()}
+    request = {"id": request_id, "params": params, "timestamp": time.time(), "changed_param": changed_param}
     with open(REQUEST_FILE, "w") as f:
         json.dump(request, f, indent=2)
-    print(f"  [Orchestrator] Backtest request #{request_id} sent")
+    group = "crypto" if changed_param.startswith("crypto_overrides.") else ("forex" if changed_param.startswith("forex_overrides.") else "all")
+    print(f"  [Orchestrator] Backtest request #{request_id} sent (group: {group})")
 
 
 def wait_for_backtest(request_id):
@@ -329,7 +330,7 @@ def run(max_iterations=100, skip_data_download=False):
         # Backtest
         print("\n  [Backtest] Requesting parallel backtest...")
         request_id = f"iter_{i}"
-        request_backtest(new_params, request_id)
+        request_backtest(new_params, request_id, changed_param=param_name)
         bt_result = wait_for_backtest(request_id)
 
         new_score = bt_result.get("avg_score", 0)
