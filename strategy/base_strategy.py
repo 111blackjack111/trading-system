@@ -83,6 +83,125 @@ def detect_bos(df, swing_length):
     return pd.Series(trend, index=df.index)
 
 
+def detect_order_blocks(df, swing_length):
+    """
+    Order Block — последняя свеча перед импульсным движением (displacement).
+    Bullish OB: последняя медвежья свеча перед бычьим импульсом
+    Bearish OB: последняя бычья свеча перед медвежьим импульсом
+    """
+    n = len(df)
+    ob_list = []
+    atr = calculate_atr(df)
+
+    for i in range(2, n - 1):
+        atr_val = atr.iloc[i] if not np.isnan(atr.iloc[i]) else 0
+        if atr_val <= 0:
+            continue
+
+        # Displacement = движение > 1.5 ATR за 1-2 бара
+        move_up = df["close"].iloc[i] - df["close"].iloc[i - 2]
+        move_down = df["close"].iloc[i - 2] - df["close"].iloc[i]
+
+        if move_up > atr_val * 1.5:
+            # Bullish displacement — ищем последнюю медвежью свечу перед ним
+            for j in range(i - 1, max(i - 4, 0), -1):
+                if df["close"].iloc[j] < df["open"].iloc[j]:  # медвежья свеча
+                    ob_list.append({
+                        "index": i,
+                        "timestamp": df.index[i],
+                        "type": "bullish",
+                        "top": df["high"].iloc[j],
+                        "bottom": df["low"].iloc[j],
+                    })
+                    break
+
+        elif move_down > atr_val * 1.5:
+            # Bearish displacement — ищем последнюю бычью свечу перед ним
+            for j in range(i - 1, max(i - 4, 0), -1):
+                if df["close"].iloc[j] > df["open"].iloc[j]:  # бычья свеча
+                    ob_list.append({
+                        "index": i,
+                        "timestamp": df.index[i],
+                        "type": "bearish",
+                        "top": df["high"].iloc[j],
+                        "bottom": df["low"].iloc[j],
+                    })
+                    break
+
+    return ob_list
+
+
+def detect_liquidity_sweep(df_h1, current_idx, swing_highs, swing_lows, lookback=20):
+    """
+    Liquidity Sweep — цена пробила свинг и вернулась.
+    Институционалы собирают стопы перед реальным движением.
+    Returns: 'bullish_sweep', 'bearish_sweep', or None
+    """
+    if current_idx < lookback + 2:
+        return None
+
+    # Ищем равные хаи/лои в последних lookback барах
+    recent_highs = []
+    recent_lows = []
+    for j in range(current_idx - lookback, current_idx - 1):
+        if j >= 0 and not np.isnan(swing_highs[j]):
+            recent_highs.append(swing_highs[j])
+        if j >= 0 and not np.isnan(swing_lows[j]):
+            recent_lows.append(swing_lows[j])
+
+    if not recent_highs and not recent_lows:
+        return None
+
+    current_high = df_h1["high"].iloc[current_idx]
+    current_low = df_h1["low"].iloc[current_idx]
+    current_close = df_h1["close"].iloc[current_idx]
+
+    # Bullish sweep: цена пробила лой вниз но закрылась выше (собрала стопы)
+    if recent_lows:
+        min_low = min(recent_lows)
+        if current_low < min_low and current_close > min_low:
+            return "bullish_sweep"
+
+    # Bearish sweep: цена пробила хай вверх но закрылась ниже
+    if recent_highs:
+        max_high = max(recent_highs)
+        if current_high > max_high and current_close < max_high:
+            return "bearish_sweep"
+
+    return None
+
+
+def detect_choch(df, swing_length):
+    """
+    Change of Character (CHoCH) — ранний сигнал разворота тренда.
+    CHoCH = первый пробой структуры ПРОТИВ текущего тренда.
+    Returns: Series с 1 (bullish CHoCH), -1 (bearish CHoCH), 0 (нет)
+    """
+    swing_highs, swing_lows = detect_swing_points(df, swing_length)
+    n = len(df)
+    choch = np.zeros(n)
+    trend = detect_bos(df, swing_length)
+
+    last_sh = np.nan
+    last_sl = np.nan
+
+    for i in range(n):
+        if not np.isnan(swing_highs[i]):
+            last_sh = swing_highs[i]
+        if not np.isnan(swing_lows[i]):
+            last_sl = swing_lows[i]
+
+        # CHoCH: пробой против текущего тренда
+        if trend.iloc[i] == -1 and not np.isnan(last_sh):
+            if df["close"].iloc[i] > last_sh:
+                choch[i] = 1  # bullish CHoCH в медвежьем тренде
+        elif trend.iloc[i] == 1 and not np.isnan(last_sl):
+            if df["close"].iloc[i] < last_sl:
+                choch[i] = -1  # bearish CHoCH в бычьем тренде
+
+    return pd.Series(choch, index=df.index)
+
+
 def detect_fvg(df, min_size_multiplier, atr_period=14):
     """
     Fair Value Gap — имбаланс.
@@ -231,6 +350,9 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
         params.update(params["forex_overrides"])
 
     fvg_max_age = params.get("fvg_max_age_bars", 20)
+    use_ob_filter = params.get("ob_confluence", True)
+    use_sweep_filter = params.get("sweep_filter", True)
+    use_choch = params.get("choch_filter", False)
 
     # 1. Определяем тренд на H1
     trend = detect_bos(df_h1, params["bos_swing_length"])
@@ -242,6 +364,15 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
     atr_h1 = calculate_atr(df_h1)
     atr_m3 = calculate_atr(df_m3)
 
+    # 4. Order Blocks (для confluence фильтра)
+    ob_list = detect_order_blocks(df_h1, params["bos_swing_length"]) if use_ob_filter else []
+
+    # 5. Swing points (для liquidity sweep)
+    swing_highs, swing_lows = detect_swing_points(df_h1, params["bos_swing_length"])
+
+    # 6. CHoCH (ранние развороты)
+    choch = detect_choch(df_h1, params["bos_swing_length"]) if use_choch else None
+
     signals = []
     active_fvgs = []  # FVG которые ещё не отработали
 
@@ -250,11 +381,37 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
         if idx >= len(trend):
             continue
 
-        # FVG должен совпадать с трендом
-        if fvg["type"] == "bullish" and trend.iloc[idx] != 1:
+        # FVG должен совпадать с трендом или CHoCH
+        trend_ok = False
+        if fvg["type"] == "bullish" and trend.iloc[idx] == 1:
+            trend_ok = True
+        elif fvg["type"] == "bearish" and trend.iloc[idx] == -1:
+            trend_ok = True
+        # CHoCH: разрешаем вход на ранних разворотах
+        if not trend_ok and use_choch and choch is not None:
+            if fvg["type"] == "bullish" and choch.iloc[idx] == 1:
+                trend_ok = True
+            elif fvg["type"] == "bearish" and choch.iloc[idx] == -1:
+                trend_ok = True
+
+        if not trend_ok:
             continue
-        if fvg["type"] == "bearish" and trend.iloc[idx] != -1:
-            continue
+
+        # OB Confluence: FVG должен быть рядом с Order Block
+        if use_ob_filter and ob_list:
+            has_ob = False
+            for ob in ob_list:
+                if ob["type"] != fvg["type"]:
+                    continue
+                # OB в пределах 3 баров от FVG и зоны перекрываются
+                if abs(ob["index"] - fvg["index"]) <= 5:
+                    # Проверяем перекрытие зон
+                    overlap = min(ob["top"], fvg["top"]) - max(ob["bottom"], fvg["bottom"])
+                    if overlap > 0:
+                        has_ob = True
+                        break
+            if not has_ob:
+                continue  # Нет OB confluence — пропускаем FVG
 
         active_fvgs.append(fvg)
 
@@ -297,6 +454,19 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                 fvg_age = current_h1_idx - fvg["index"]
                 if fvg_age > fvg_max_age:
                     continue  # FVG слишком старый — удаляем
+
+            # Liquidity Sweep: проверяем был ли sweep перед входом
+            if use_sweep_filter and current_h1_idx is not None:
+                sweep = detect_liquidity_sweep(df_h1, current_h1_idx, swing_highs, swing_lows)
+                if sweep is not None:
+                    # Sweep есть — входим только если совпадает с направлением
+                    if fvg["type"] == "bullish" and sweep != "bullish_sweep":
+                        remaining_fvgs.append(fvg)
+                        continue
+                    if fvg["type"] == "bearish" and sweep != "bearish_sweep":
+                        remaining_fvgs.append(fvg)
+                        continue
+                    # sweep совпал — бонус к confidence (проходим дальше)
 
             close = df_m3["close"].iloc[i]
             low = df_m3["low"].iloc[i]
