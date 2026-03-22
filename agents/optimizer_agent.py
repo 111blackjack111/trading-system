@@ -250,11 +250,8 @@ For parameter changes:
 
 
 def suggest_change(params=None):
-    """Вызывает Claude API и получает предложение."""
-    import anthropic
-
-    if not config.ANTHROPIC_API_KEY:
-        raise ValueError("ANTHROPIC_API_KEY not set")
+    """Вызывает Claude CLI (подписка Max) для предложения изменений. Расход API = $0."""
+    import subprocess
 
     if params is None:
         params = load_params()
@@ -263,21 +260,21 @@ def suggest_change(params=None):
     metrics = get_current_metrics()
     trade_log = get_trade_log()
 
-    # Code changes отключены на API — делаются через Claude Code (подписка).
-    # API делает только дешёвые param changes (~0.3¢ за итерацию).
     allow_code_changes = False
 
     prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes)
 
-    client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model="claude-4-sonnet-20250514",
-        max_tokens=1500 if allow_code_changes else 300,
-        messages=[{"role": "user", "content": prompt}],
+    # Вызываем Claude CLI через подписку Max (бесплатно)
+    result = subprocess.run(
+        ["claude", "-p", prompt, "--output-format", "text"],
+        capture_output=True, text=True, timeout=120,
+        cwd=os.path.join(os.path.dirname(__file__), ".."),
     )
 
-    # Парсим JSON из ответа
-    text = response.content[0].text.strip()
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude CLI error: {result.stderr[:200]}")
+
+    text = result.stdout.strip()
 
     # Извлекаем JSON если обёрнут в markdown
     if "```json" in text:
