@@ -7,6 +7,10 @@ ITERATIONS=${1:-100}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$DIR/venv/bin/activate"
 
+# Claude CLI использует подписку Max, НЕ API ключ.
+# Если ANTHROPIC_API_KEY установлен — CLI попытается использовать его и упадёт.
+unset ANTHROPIC_API_KEY
+
 echo "=== Trading System Launch ==="
 echo "Directory: $DIR"
 echo "Iterations: $ITERATIONS"
