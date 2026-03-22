@@ -99,30 +99,23 @@ def calculate_metrics(trades):
 
 def calculate_score(sharpe, profit_factor, max_drawdown, winrate, total_trades):
     """
-    Composite score для оптимизации.
-    Плавная шкала вместо бинарных штрафов — оптимизатор видит прогресс.
-
-    score = sharpe * 0.4 + profit_factor * 0.3 - max_drawdown * 0.2 + winrate * 0.1 - winrate_penalty
+    Composite score v3 — quality-focused.
+    quality = winrate * profit_factor (качество сделок)
+    score = sharpe * 0.35 + quality * 0.35 - max_drawdown * 0.2 + 0.1
     """
     if total_trades < 10:
         return -999  # Недостаточно сделок — не считать улучшением
 
-    # Плавный штраф за низкий WR (вместо бинарного отсечения)
-    winrate_penalty = max(0, 0.40 - winrate) * 2.0
+    quality = winrate * profit_factor
 
-    # Плавный штраф за drawdown (вместо бинарного)
+    # Плавный штраф за drawdown
     dd_penalty = max(0, max_drawdown - 0.10) * 3.0
 
-    # Штраф за мало сделок (плавный от 10 до 30)
-    trade_penalty = max(0, (30 - total_trades) / 30) * 0.5 if total_trades < 30 else 0
-
-    score = (sharpe * 0.4
-             + profit_factor * 0.3
+    score = (sharpe * 0.35
+             + quality * 0.35
              - max_drawdown * 0.2
-             + winrate * 0.1
-             - winrate_penalty
-             - dd_penalty
-             - trade_penalty)
+             + 0.1
+             - dd_penalty)
 
     return score
 
