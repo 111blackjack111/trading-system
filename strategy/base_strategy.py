@@ -303,10 +303,18 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
             high = df_m3["high"].iloc[i]
             entry_depth = params["fvg_entry_depth"]
 
+            # Confirmation candle filter
+            confirm_pct = params.get("confirmation_candle_pct", 0.0)
+            candle_range = high - low if high > low else 0.0001
+
             if fvg["type"] == "bullish":
                 # Цена вошла в bullish FVG (зона между bottom и top)
                 entry_level = fvg["top"] - (fvg["top"] - fvg["bottom"]) * entry_depth
                 if low <= entry_level and close > fvg["bottom"]:
+                    # Confirmation: close должен быть в верхней части свечи
+                    if confirm_pct > 0 and (close - low) / candle_range < confirm_pct:
+                        remaining_fvgs.append(fvg)
+                        continue  # Слабая реакция — пропускаем
                     # Реакция от FVG — close выше дна зоны
                     atr_val = atr_m3.iloc[i] if i < len(atr_m3) and not np.isnan(atr_m3.iloc[i]) else (atr_h1.iloc[-1] if len(atr_h1) > 0 and not np.isnan(atr_h1.iloc[-1]) else None)
                     if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
@@ -334,6 +342,10 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
             elif fvg["type"] == "bearish":
                 entry_level = fvg["bottom"] + (fvg["top"] - fvg["bottom"]) * entry_depth
                 if high >= entry_level and close < fvg["top"]:
+                    # Confirmation: close должен быть в нижней части свечи
+                    if confirm_pct > 0 and (high - close) / candle_range < confirm_pct:
+                        remaining_fvgs.append(fvg)
+                        continue  # Слабая реакция — пропускаем
                     atr_val = atr_m3.iloc[i] if i < len(atr_m3) and not np.isnan(atr_m3.iloc[i]) else (atr_h1.iloc[-1] if len(atr_h1) > 0 and not np.isnan(atr_h1.iloc[-1]) else None)
                     if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
                         remaining_fvgs.append(fvg)

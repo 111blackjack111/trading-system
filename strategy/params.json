@@ -11,6 +11,7 @@
   "volatility_filter": true,
   "min_atr_percentile": 40,
   "fvg_max_age_bars": 14,
+  "confirmation_candle_pct": 0.6,
   "news_filter": true,
   "crypto_hours_filter": true,
   "crypto_overrides": {

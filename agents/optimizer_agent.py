@@ -30,6 +30,7 @@ PARAM_RANGES = {
     "tp_rr_ratio": (1.5, 4.0),
     "min_atr_percentile": (15, 70),
     "fvg_max_age_bars": (5, 50),
+    "confirmation_candle_pct": (0.0, 0.8),
     # Группа-специфичные (crypto_overrides.X, forex_overrides.X)
     "crypto_overrides.be_trigger_rr": (0.5, 1.5),
     "crypto_overrides.sl_atr_multiplier": (1.0, 3.0),
