@@ -1,57 +1,70 @@
 #!/bin/bash
-# Запуск всех агентов в одной TMUX сессии с 4 сплитами
+# Запуск всех агентов в отдельных TMUX сессиях
 # Usage: ./launch.sh [iterations]
-#
-# Layout (2x2):
-#   ┌──────────────┬──────────────┐
-#   │ orchestrator  │   backtest   │
-#   ├──────────────┼──────────────┤
-#   │   impulse    │   monitor    │
-#   └──────────────┴──────────────┘
-#
-# Навигация: Ctrl+B, стрелки
 
 ITERATIONS=${1:-100}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$DIR/venv/bin/activate"
-SESSION="trading"
 
 # Claude CLI использует подписку Max, НЕ API ключ.
 unset ANTHROPIC_API_KEY
-export PATH="/Users/a1/.npm-global/bin:$PATH"
+export PATH="/usr/local/bin:/root/.npm-global/bin:/Users/a1/.npm-global/bin:$PATH"
 
 echo "=== Trading System Launch ==="
 echo "Directory: $DIR"
 echo "Iterations: $ITERATIONS"
 
-# Убиваем старую сессию
-tmux kill-session -t $SESSION 2>/dev/null
+# Убиваем старые сессии
+tmux kill-session -t backtest 2>/dev/null
+tmux kill-session -t orchestrator 2>/dev/null
+tmux kill-session -t impulse 2>/dev/null
+tmux kill-session -t monitor 2>/dev/null
+tmux kill-session -t trading 2>/dev/null
 
-# Создаём сессию с первым pane — orchestrator
-tmux new-session -d -s $SESSION -n agents \
-  "cd $DIR && source $VENV && python3 agents/orchestrator_v2.py --iterations $ITERATIONS --skip-data 2>&1 | tee results/orchestrator.log; echo '[Orchestrator finished. Press Enter]'; read"
+# 1. BacktestAgent
+echo "Starting BacktestAgent..."
+tmux new-session -d -s backtest "
+cd $DIR && source $VENV
+python3 agents/backtest_agent.py --mode watch
+"
 
-# Split right — backtest
-tmux split-window -h -t $SESSION:agents \
-  "cd $DIR && source $VENV && python3 agents/backtest_agent.py --mode watch; echo '[Backtest stopped. Press Enter]'; read"
+sleep 2
 
-# Split bottom-left — impulse
-tmux select-pane -t $SESSION:agents.0
-tmux split-window -v -t $SESSION:agents \
-  "cd $DIR && source $VENV && while true; do echo \"[ImpulseAgent] Scan started at \$(date)\"; python3 agents/impulse_agent.py --mode scan --days 7 2>&1 | tee -a results/impulse.log; echo \"[ImpulseAgent] Sleeping 1 hour...\"; sleep 3600; done"
+# 2. Orchestrator v2
+echo "Starting Orchestrator v2..."
+tmux new-session -d -s orchestrator "
+cd $DIR && source $VENV
+python3 agents/orchestrator_v2.py --iterations $ITERATIONS --skip-data 2>&1 | tee results/orchestrator.log
+"
 
-# Split bottom-right — monitor
-tmux select-pane -t $SESSION:agents.2
-tmux split-window -v -t $SESSION:agents \
-  "cd $DIR && source $VENV && export TELEGRAM_BOT_TOKEN='${TELEGRAM_BOT_TOKEN}' && export TELEGRAM_CHAT_ID='${TELEGRAM_CHAT_ID}' && python3 agents/monitor_agent.py 2>&1 | tee results/monitor.log; echo '[Monitor stopped. Press Enter]'; read"
+# 3. ImpulseAgent
+echo "Starting ImpulseAgent..."
+tmux new-session -d -s impulse "
+cd $DIR && source $VENV
+while true; do
+  echo \"[ImpulseAgent] Scan started at \$(date)\"
+  python3 agents/impulse_agent.py --mode scan --days 7 2>&1 | tee -a results/impulse.log
+  echo \"[ImpulseAgent] Sleeping 1 hour...\"
+  sleep 3600
+done
+"
 
-# Выравниваем panes
-tmux select-layout -t $SESSION:agents tiled
+# 4. MonitorAgent
+echo "Starting MonitorAgent..."
+tmux new-session -d -s monitor "
+cd $DIR && source $VENV
+python3 agents/monitor_agent.py 2>&1 | tee results/monitor.log
+"
 
 echo ""
-echo "=== All agents started in tmux session '$SESSION' ==="
+echo "=== All agents started ==="
 echo ""
-echo "  tmux attach -t $SESSION     # view all agents"
-echo "  Ctrl+B, arrow keys          # switch between panes"
-echo "  Ctrl+B, D                   # detach"
+echo "TMUX sessions:"
+tmux list-sessions
 echo ""
+echo "Commands:"
+echo "  tmux attach -t orchestrator  # watch optimization"
+echo "  tmux attach -t backtest      # watch backtests"
+echo "  tmux attach -t impulse       # watch impulse scanner"
+echo "  tmux attach -t monitor       # watch monitor/telegram"
+echo "  Ctrl+B, D                    # detach from session"
