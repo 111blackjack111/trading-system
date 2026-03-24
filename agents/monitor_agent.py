@@ -92,26 +92,8 @@ def read_trade_log():
 
 
 def check_api_health():
-    """Проверяет работает ли Anthropic API."""
-    try:
-        import anthropic
-        api_key = getattr(config, 'ANTHROPIC_API_KEY', '')
-        if not api_key:
-            return False
-        client = anthropic.Anthropic(api_key=api_key)
-        client.messages.create(
-            model="claude-4-sonnet-20250514",
-            max_tokens=5,
-            messages=[{"role": "user", "content": "ping"}],
-        )
-        return True
-    except Exception as e:
-        err = str(e)
-        if "credit" in err.lower() or "limit" in err.lower() or "balance" in err.lower():
-            print(f"[Monitor] API credit/limit error: {err[:100]}")
-            return False
-        # Other errors (network etc) - don't alert
-        return True
+    """Claude CLI работает через Max подписку, API не используется."""
+    return True
 
 
 def check_tmux_session(name):
@@ -130,11 +112,9 @@ def restart_tmux_session(name):
     """Перезапускает tmux сессию агента."""
     base = os.path.abspath(BASE_DIR)
     venv = os.path.join(base, "venv", "bin", "activate")
-    api_key = getattr(config, 'ANTHROPIC_API_KEY', '') or ""
-
     commands = {
-        "backtest": f"cd {base} && source {venv} && export ANTHROPIC_API_KEY='{api_key}' && python3 agents/backtest_agent.py --mode watch",
-        "orchestrator": f"cd {base} && source {venv} && export ANTHROPIC_API_KEY='{api_key}' && python3 agents/orchestrator_v2.py --iterations 100 --skip-data 2>&1 | tee results/orchestrator.log",
+        "backtest": f"cd {base} && source {venv} && python3 agents/backtest_agent.py --mode watch",
+        "orchestrator": f"cd {base} && source {venv} && python3 agents/orchestrator_v2.py --iterations 100 --skip-data 2>&1 | tee results/orchestrator.log",
     }
 
     if name not in commands:

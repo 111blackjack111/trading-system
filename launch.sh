@@ -6,8 +6,6 @@ ITERATIONS=${1:-100}
 DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV="$DIR/venv/bin/activate"
 
-# Claude CLI использует подписку Max, НЕ API ключ.
-unset ANTHROPIC_API_KEY
 export PATH="/usr/local/bin:/root/.npm-global/bin:/Users/a1/.npm-global/bin:$PATH"
 
 echo "=== Trading System Launch ==="
