@@ -16,6 +16,7 @@ import os
 import json
 import sqlite3
 import subprocess
+import base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from urllib.parse import urlparse, parse_qs
@@ -1318,8 +1319,24 @@ setInterval(fetchData,10000);
 
 # --------------- HTTP handler ---------------
 
+AUTH_USER = "111blackjack111"
+AUTH_PASS = "qwertrewq123454321"
+
 class Handler(BaseHTTPRequestHandler):
+    def _check_auth(self):
+        auth = self.headers.get("Authorization")
+        if auth and auth.startswith("Basic "):
+            decoded = base64.b64decode(auth[6:]).decode()
+            if decoded == f"{AUTH_USER}:{AUTH_PASS}":
+                return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Trading Dashboard"')
+        self.end_headers()
+        return False
+
     def do_GET(self):
+        if not self._check_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/data":
             qs = parse_qs(parsed.query)

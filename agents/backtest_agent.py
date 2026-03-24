@@ -26,12 +26,12 @@ DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
 # Проверенные пары (всегда активны)
 CORE_INSTRUMENTS = {
-    "USD_JPY", "BTCUSDT", "EUR_GBP", "GBP_USD",
+    "USD_JPY", "EUR_GBP", "GBP_USD",
 }
 
 # Тестовые пары для ночного режима — все доступные, дадим второй шанс
 NIGHT_INSTRUMENTS = {
-    "EUR_USD", "XAU_USD", "NZD_JPY", "ETHUSDT",
+    "EUR_USD", "XAU_USD", "BTCUSDT", "NZD_JPY", "ETHUSDT",
     "BNBUSDT", "SOLUSDT", "GBP_JPY", "GER40",
 }
 

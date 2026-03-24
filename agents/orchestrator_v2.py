@@ -30,7 +30,7 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
-TIMEOUT_BACKTEST = 3600  # 60 минут макс (5 лет × 12 инструментов = тяжёлый бэктест)
+TIMEOUT_BACKTEST = 5400  # 60 минут макс (5 лет × 12 инструментов = тяжёлый бэктест)
 
 
 def is_night_mode():
