@@ -19,10 +19,9 @@ sys.stderr.reconfigure(line_buffering=True)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
+from db.db_manager import get_latest_trade_log as db_get_trade_log
 
 BASE_DIR = os.path.join(os.path.dirname(__file__), "..")
-RESULTS_TSV = os.path.join(BASE_DIR, "results", "results.tsv")
-TRADE_LOG = os.path.join(BASE_DIR, "runtime", "trade_log.json")
 DB_PATH = os.path.join(BASE_DIR, "db", "experiments.db")
 
 CHECK_INTERVAL = 30          # проверяем каждые 30 секунд
@@ -66,43 +65,37 @@ def send_telegram(message):
 
 
 def read_results_tsv():
-    """Читает results.tsv и возвращает список строк."""
-    if not os.path.exists(RESULTS_TSV):
+    """Читает эксперименты из БД (замена results.tsv)."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT iteration, timestamp, param_changed as param, "
+            "old_value as old_val, new_value as new_val, "
+            "round(avg_score,4) as avg_score, round(best_score,4) as best_score, "
+            "best_instrument as best_inst, total_trades as trades, "
+            "round(avg_winrate,4) as winrate, round(avg_pf,4) as pf, action "
+            "FROM experiments ORDER BY id"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception:
         return []
-
-    rows = []
-    with open(RESULTS_TSV) as f:
-        lines = f.readlines()
-
-    if len(lines) <= 1:
-        return []
-
-    header = lines[0].strip().split("\t")
-    for line in lines[1:]:
-        parts = line.strip().split("\t")
-        if len(parts) >= len(header):
-            row = dict(zip(header, parts))
-            rows.append(row)
-
-    return rows
 
 
 def read_trade_log():
-    """Читает trade_log.json."""
-    if not os.path.exists(TRADE_LOG):
-        return None
-    try:
-        with open(TRADE_LOG) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return None
+    """Читает trade_log из БД."""
+    result = db_get_trade_log()
+    if result:
+        return result["data"]
+    return None
 
 
 def check_api_health():
     """Проверяет работает ли Anthropic API."""
     try:
         import anthropic
-        api_key = config.ANTHROPIC_API_KEY
+        api_key = getattr(config, 'ANTHROPIC_API_KEY', '')
         if not api_key:
             return False
         client = anthropic.Anthropic(api_key=api_key)
@@ -137,7 +130,7 @@ def restart_tmux_session(name):
     """Перезапускает tmux сессию агента."""
     base = os.path.abspath(BASE_DIR)
     venv = os.path.join(base, "venv", "bin", "activate")
-    api_key = config.ANTHROPIC_API_KEY or ""
+    api_key = getattr(config, 'ANTHROPIC_API_KEY', '') or ""
 
     commands = {
         "backtest": f"cd {base} && source {venv} && export ANTHROPIC_API_KEY='{api_key}' && python3 agents/backtest_agent.py --mode watch",
@@ -278,12 +271,17 @@ def run():
                     current_iter = 0
 
             # --- 1. Проверка активности (зависание) ---
-            tsv_mtime = 0
-            if os.path.exists(RESULTS_TSV):
-                tsv_mtime = os.path.getmtime(RESULTS_TSV)
+            # Check latest experiment timestamp from DB
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                row = conn.execute("SELECT MAX(id) FROM experiments").fetchone()
+                conn.close()
+                latest_id = row[0] if row else 0
+            except Exception:
+                latest_id = 0
 
-            if tsv_mtime > last_tsv_modified:
-                last_tsv_modified = tsv_mtime
+            if latest_id > last_tsv_modified:
+                last_tsv_modified = latest_id
                 last_activity_time = time.time()
                 hang_alerted = False
 

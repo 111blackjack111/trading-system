@@ -16,11 +16,11 @@ import urllib.request
 import urllib.parse
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from db.db_manager import save_analyst_report as db_save_report, get_latest_trade_log as db_get_trade_log
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "experiments.db")
 PARAMS_PATH = os.path.join(os.path.dirname(__file__), "..", "strategy", "params.json")
-REPORT_PATH = os.path.join(RUNTIME_DIR, "analyst_report.json")
 
 
 def send_telegram(message):
@@ -84,11 +84,10 @@ def get_all_keeps():
 
 
 def get_trade_log():
-    path = os.path.join(RUNTIME_DIR, "trade_log.json")
-    if not os.path.exists(path):
-        return {}
-    with open(path) as f:
-        return json.load(f)
+    result = db_get_trade_log()
+    if result:
+        return result["data"]
+    return {}
 
 
 def get_params():
@@ -207,10 +206,8 @@ def run_analysis(consecutive_reverts=0, blacklist_info="none"):
         print(f"[Analyst] Raw text: {text[:300]}")
         return None
 
-    # Save report
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    with open(REPORT_PATH, "w") as f:
-        json.dump(report, f, indent=2)
+    # Save report to DB
+    db_save_report(None, report)
 
     print(f"[Analyst] Diagnosis: {report.get('diagnosis', 'N/A')}")
     print(f"[Analyst] Trend: {report.get('trend', 'N/A')}")

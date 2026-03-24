@@ -16,6 +16,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from backtest.runner import run_backtest, calculate_metrics
+from db.db_manager import save_instrument_metrics as db_save_metrics, save_trade_log as db_save_trade_log
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 CSV_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "csv")
@@ -117,15 +118,12 @@ def run_parallel_backtest(params, force_reload=False, instruments_override=None)
     return results
 
 
-def save_metrics(results):
-    """Сохраняет метрики в runtime/."""
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
+def save_metrics(results, iteration=None):
+    """Сохраняет метрики в БД."""
     for inst, res in results.items():
         metrics = res.get("metrics")
         if metrics:
-            path = os.path.join(RUNTIME_DIR, f"metrics_{inst}.json")
-            with open(path, "w") as f:
-                json.dump(metrics, f, indent=2)
+            db_save_metrics(iteration, inst, metrics)
 
 
 def classify_session(timestamp):
@@ -257,9 +255,7 @@ def generate_trade_log(results):
         "exit_reason_breakdown": exit_reasons,
     }
 
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    with open(os.path.join(RUNTIME_DIR, "trade_log.json"), "w") as f:
-        json.dump(trade_log, f, indent=2)
+    db_save_trade_log(None, trade_log)
 
     return trade_log
 
@@ -324,7 +320,8 @@ def watch():
                     results.update(partial)
                     _result_cache = dict(results)
 
-                save_metrics(results)
+                iteration = request.get("iteration")
+                save_metrics(results, iteration=iteration)
                 generate_trade_log(results)
 
                 # Считаем средний score

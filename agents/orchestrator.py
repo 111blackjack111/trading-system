@@ -22,7 +22,6 @@ from agents.data_agent import run as run_data_agent
 DB_DIR = os.path.join(os.path.dirname(__file__), "..", "db")
 DB_PATH = os.path.join(DB_DIR, "experiments.db")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-RESULTS_TSV = os.path.join(RESULTS_DIR, "results.tsv")
 PARAMS_PATH = os.path.join(os.path.dirname(__file__), "..", "strategy", "params.json")
 
 
@@ -102,18 +101,7 @@ def save_experiment(iteration, suggestion, metrics_all, action, params):
     conn.commit()
     conn.close()
 
-    # Append to TSV
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    header_needed = not os.path.exists(RESULTS_TSV)
-    with open(RESULTS_TSV, "a") as f:
-        if header_needed:
-            f.write("iteration\ttimestamp\tparam\told_val\tnew_val\tavg_score\tbest_score\tbest_inst\ttrades\twinrate\tpf\taction\n")
-        f.write(f"{iteration}\t{datetime.utcnow().isoformat()}\t"
-                f"{suggestion.get('param', 'baseline')}\t{suggestion.get('old_value', 0)}\t"
-                f"{suggestion.get('new_value', 0)}\t{round(avg_score, 4)}\t{round(best_score, 4)}\t"
-                f"{best_inst}\t{total_trades}\t"
-                f"{round(sum(winrates) / len(winrates), 4) if winrates else 0}\t"
-                f"{round(sum(pfs) / len(pfs), 4) if pfs else 0}\t{action}\n")
+    # TSV removed — all data is in experiments.db
 
 
 def get_avg_score(metrics_all):

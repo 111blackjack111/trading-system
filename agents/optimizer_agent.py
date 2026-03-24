@@ -14,6 +14,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
 from strategy.base_strategy import load_params
+from db.db_manager import save_suggestion as db_save_suggestion
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "experiments.db")
@@ -96,27 +97,19 @@ def get_experiment_history():
 
 
 def get_current_metrics():
-    """Читает текущие метрики из runtime/."""
-    metrics = {}
-    if not os.path.exists(RUNTIME_DIR):
-        return metrics
-
-    for f in os.listdir(RUNTIME_DIR):
-        if f.startswith("metrics_") and f.endswith(".json"):
-            instrument = f.replace("metrics_", "").replace(".json", "")
-            with open(os.path.join(RUNTIME_DIR, f)) as fh:
-                metrics[instrument] = json.load(fh)
-
-    return metrics
+    """Читает текущие метрики из БД."""
+    from db.db_manager import get_latest_instrument_metrics
+    rows = get_latest_instrument_metrics()
+    return {r["instrument"]: r for r in rows}
 
 
 def get_trade_log():
-    """Читает trade_log.json и возвращает компактную версию (экономия токенов)."""
-    path = os.path.join(RUNTIME_DIR, "trade_log.json")
-    if not os.path.exists(path):
+    """Читает trade_log из БД и возвращает компактную версию (экономия токенов)."""
+    from db.db_manager import get_latest_trade_log
+    result = get_latest_trade_log()
+    if not result:
         return None
-    with open(path) as f:
-        full = json.load(f)
+    full = result["data"]
 
     # Компактная версия: только ключевые метрики + 5 последних losers
     summary = {
@@ -379,11 +372,8 @@ def suggest_change(params=None, blacklisted_params=None):
         print(f"  Suggestion: {param} {suggestion.get('old_value')} -> {suggestion['new_value']}")
         print(f"  Reasoning: {suggestion.get('reasoning', 'N/A')}")
 
-    # Сохраняем
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    suggestion_path = os.path.join(RUNTIME_DIR, "suggestion.json")
-    with open(suggestion_path, "w") as f:
-        json.dump(suggestion, f, indent=2)
+    # Сохраняем в БД
+    db_save_suggestion(None, suggestion)
 
     return suggestion
 

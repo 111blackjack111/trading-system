@@ -15,6 +15,7 @@ import math
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from strategy.base_strategy import load_params
+from db.db_manager import save_suggestion as db_save_suggestion
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "db", "experiments.db")
@@ -31,6 +32,9 @@ PARAM_CONFIG = {
     "min_atr_percentile":      {"min": 20,  "max": 60,  "step": 5,    "type": "int"},
     "fvg_max_age_bars":        {"min": 5,   "max": 50,  "step": 5,    "type": "int"},
 }
+
+# Compatible with orchestrator_v2 (expects dict of param -> (low, high))
+PARAM_RANGES = {k: (v["min"], v["max"]) for k, v in PARAM_CONFIG.items()}
 
 
 def get_experiment_history(limit=50):
@@ -74,7 +78,7 @@ def analyze_history(history):
     return stats
 
 
-def suggest_change(params=None):
+def suggest_change(params=None, blacklisted_params=None):
     """
     Предлагает одно изменение параметра.
 
@@ -95,7 +99,7 @@ def suggest_change(params=None):
     temperature = max(0.3, 1.0 - iteration * 0.01)
 
     # Выбираем параметр
-    param = choose_param(params, stats, temperature)
+    param = choose_param(params, stats, temperature, blacklisted_params=blacklisted_params)
     cfg = PARAM_CONFIG[param]
     current_val = params.get(param, (cfg["min"] + cfg["max"]) / 2)
 
@@ -133,10 +137,8 @@ def suggest_change(params=None):
         "reasoning": reasoning,
     }
 
-    # Сохраняем
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    with open(os.path.join(RUNTIME_DIR, "suggestion.json"), "w") as f:
-        json.dump(suggestion, f, indent=2)
+    # Сохраняем в БД
+    db_save_suggestion(None, suggestion)
 
     print(f"  Suggestion: {param} {current_val} -> {new_val}")
     print(f"  Reasoning: {reasoning}")
@@ -144,11 +146,14 @@ def suggest_change(params=None):
     return suggestion
 
 
-def choose_param(params, stats, temperature):
+def choose_param(params, stats, temperature, blacklisted_params=None):
     """Выбирает параметр для изменения."""
+    blacklisted_params = blacklisted_params or set()
     weights = {}
 
     for param in PARAM_CONFIG:
+        if param in blacklisted_params:
+            continue
         if param not in stats:
             # Не пробовали — высокий приоритет
             weights[param] = 3.0

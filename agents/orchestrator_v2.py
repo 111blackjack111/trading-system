@@ -27,8 +27,6 @@ RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 DB_DIR = os.path.join(os.path.dirname(__file__), "..", "db")
 DB_PATH = os.path.join(DB_DIR, "experiments.db")
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-RESULTS_TSV = os.path.join(RESULTS_DIR, "results.tsv")
-
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
@@ -277,16 +275,7 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
     conn.commit()
     conn.close()
 
-    # TSV
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    header_needed = not os.path.exists(RESULTS_TSV)
-    with open(RESULTS_TSV, "a") as f:
-        if header_needed:
-            f.write("iteration\ttimestamp\tparam\told_val\tnew_val\tavg_score\tbest_score\tbest_inst\ttrades\twinrate\tpf\taction\n")
-        f.write(f"{iteration}\t{now}\t"
-                f"{suggestion.get('param', 'baseline')}\t{suggestion.get('old_value', 0)}\t"
-                f"{suggestion.get('new_value', 0)}\t{round(avg_score, 4)}\t{round(best_score, 4)}\t"
-                f"{best_inst}\t{total_trades}\t{avg_wr}\t{avg_pf}\t{action}\n")
+    # TSV removed — all data is in experiments.db
 
 
 # ============================================================
