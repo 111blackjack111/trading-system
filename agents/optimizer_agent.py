@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import sqlite3
+from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import config
@@ -41,6 +42,17 @@ PARAM_RANGES = {
     "forex_overrides.tp_rr_ratio": (1.5, 3.0),
     "forex_overrides.min_atr_percentile": (20, 60),
 }
+
+
+def get_optimizer_model():
+    """Opus ночью (00-08 Kyiv/UTC+3), Sonnet днём. Экономим rate limit."""
+    from datetime import timezone, timedelta
+    kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
+    if kyiv_hour >= 24:
+        kyiv_hour -= 24
+    if 0 <= kyiv_hour < 8:
+        return "opus"
+    return "sonnet"
 
 
 def get_experiment_history():
@@ -173,7 +185,7 @@ def compute_param_priority(history):
     return "\n".join(lines)
 
 
-def build_prompt(params, history, metrics, trade_log, allow_code_changes=False):
+def build_prompt(params, history, metrics, trade_log, allow_code_changes=False, blacklisted_params=None):
     """Строит промпт для Claude."""
 
     trade_log_section = ""
@@ -271,8 +283,12 @@ score = sharpe * 0.35 + (winrate * profit_factor) * 0.35 - max_drawdown * 0.2 + 
 ## Parameter Priority (by historical impact — start with highest)
 {compute_param_priority(history)}
 
+## BLACKLISTED Parameters (DO NOT suggest these — they will be rejected)
+{json.dumps(list(blacklisted_params) if blacklisted_params else [], indent=2)}
+
 ## Rules
-1. START with highest-priority parameters that haven't been exhausted
+1. NEVER suggest blacklisted parameters — pick something else
+2. START with highest-priority parameters that haven't been exhausted
 2. Analyze the trade_log data — find PATTERNS in losses
 3. Stay within allowed ranges
 4. If a parameter was reverted 2+ times — SKIP IT, try something else
@@ -293,8 +309,9 @@ For parameter changes:
     return prompt
 
 
-def suggest_change(params=None):
-    """Вызывает Claude CLI (подписка Max) для предложения изменений. Расход API = $0."""
+def suggest_change(params=None, blacklisted_params=None):
+    """Вызывает Claude CLI (подписка Max) для предложения изменений.
+    Opus ночью (00-08), Sonnet днём (08-00). --max-tokens 300."""
     import subprocess
 
     if params is None:
@@ -306,12 +323,14 @@ def suggest_change(params=None):
 
     allow_code_changes = False
 
-    prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes)
+    prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes,
+                          blacklisted_params=blacklisted_params)
 
-    # Вызываем Claude CLI через подписку Max (бесплатно)
-    # Передаём промпт через stdin чтобы избежать лимита длины аргументов
+    model = get_optimizer_model()
+    print(f"  [Optimizer] Using model: {model} (hour={datetime.now().hour})")
+
     result = subprocess.run(
-        ["claude", "-p", "--output-format", "text"],
+        ["claude", "-p", "--output-format", "text", "--model", model],
         input=prompt,
         capture_output=True, text=True, timeout=180,
         cwd=os.path.join(os.path.dirname(__file__), ".."),

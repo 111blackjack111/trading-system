@@ -10,6 +10,7 @@ import sys
 import json
 import time
 import importlib
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -22,25 +23,42 @@ REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
 
-# Инструменты на которых стратегия работает.
-# Исключены: BNBUSDT (-42R), ETHUSDT (-16R), EUR_USD (-6R), GBP_JPY (WR 0-9%)
-# Cycle 4: убраны XAU_USD (WR 7.7%, -5R), SOLUSDT (-20R, WR 19.5%)
-# GER40 убран (10 сделок за год — статистически незначимо)
-# GBP/USD возвращён — AnalystAgent ошибочно убрал
-ACTIVE_INSTRUMENTS = {
+# Проверенные пары (всегда активны)
+CORE_INSTRUMENTS = {
     "USD_JPY", "BTCUSDT", "EUR_GBP", "GBP_USD",
 }
 
+# Тестовые пары для ночного режима — все доступные, дадим второй шанс
+NIGHT_INSTRUMENTS = {
+    "EUR_USD", "XAU_USD", "NZD_JPY", "ETHUSDT",
+    "BNBUSDT", "SOLUSDT", "GBP_JPY", "GER40",
+}
+
+# Обратная совместимость
+ACTIVE_INSTRUMENTS = CORE_INSTRUMENTS
+
+
+def is_night_mode():
+    """Ночной режим: 00:00-08:00 Kyiv (UTC+3) — расширенный набор инструментов + Opus."""
+    from datetime import timezone, timedelta
+    kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
+    if kyiv_hour >= 24:
+        kyiv_hour -= 24
+    return 0 <= kyiv_hour < 8
+
 
 def get_instruments():
-    """Определяет инструменты по наличию CSV файлов + whitelist."""
+    """Определяет инструменты по наличию CSV + режим дня/ночи."""
+    active = CORE_INSTRUMENTS | NIGHT_INSTRUMENTS if is_night_mode() else CORE_INSTRUMENTS
     instruments = set()
     if os.path.exists(CSV_DIR):
         for f in os.listdir(CSV_DIR):
             if f.endswith("_H1.csv"):
                 inst = f.replace("_H1.csv", "")
-                if inst in ACTIVE_INSTRUMENTS:
+                if inst in active:
                     instruments.add(inst)
+    mode = "NIGHT (all 12)" if is_night_mode() else "DAY (core 4)"
+    print(f"  [Instruments] {mode}: {sorted(instruments)}")
     return sorted(instruments)
 
 

@@ -35,7 +35,12 @@ def save_params(params, path=None):
 # ============================================================
 
 def detect_swing_points(df, swing_length):
-    """Находит swing high/low для определения структуры."""
+    """Находит swing high/low для определения структуры.
+    FIXED: Только backward-looking — swing point подтверждается через swing_length
+    баров ПОСЛЕ пика (ожидаем подтверждение, не заглядываем в будущее).
+    Swing high на баре i подтверждается на баре i + swing_length,
+    поэтому записывается с задержкой (confirmed_idx = i + swing_length).
+    """
     highs = df["high"].values
     lows = df["low"].values
     n = len(df)
@@ -43,11 +48,17 @@ def detect_swing_points(df, swing_length):
     swing_highs = np.full(n, np.nan)
     swing_lows = np.full(n, np.nan)
 
-    for i in range(swing_length, n - swing_length):
-        if highs[i] == max(highs[i - swing_length:i + swing_length + 1]):
-            swing_highs[i] = highs[i]
-        if lows[i] == min(lows[i - swing_length:i + swing_length + 1]):
-            swing_lows[i] = lows[i]
+    for i in range(swing_length, n):
+        # Кандидат на swing point — бар (i - swing_length)
+        # Проверяем что он был максимумом/минимумом за окно ТОЛЬКО из прошлых данных
+        candidate = i - swing_length
+        window = highs[candidate - swing_length:i + 1]  # от (candidate - swing_length) до i включительно
+        if len(window) > 0 and highs[candidate] == max(window):
+            swing_highs[i] = highs[candidate]  # записываем на баре i (момент подтверждения)
+
+        window_low = lows[candidate - swing_length:i + 1]
+        if len(window_low) > 0 and lows[candidate] == min(window_low):
+            swing_lows[i] = lows[candidate]  # записываем на баре i (момент подтверждения)
 
     return swing_highs, swing_lows
 
@@ -490,26 +501,39 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                 # Цена вошла в bullish FVG (зона между bottom и top)
                 entry_level = fvg["top"] - (fvg["top"] - fvg["bottom"]) * entry_depth
                 if low <= entry_level and close > fvg["bottom"]:
-                    # Confirmation: close должен быть в верхней части свечи
-                    if confirm_pct > 0 and (close - low) / candle_range < confirm_pct:
+                    # Confirmation: ПРЕДЫДУЩИЙ бар (i-1) должен закрыться в верхней части
+                    # FIXED: проверяем бар i-1 (уже закрытый), не текущий
+                    if confirm_pct > 0 and i > 0:
+                        prev_close = df_m3["close"].iloc[i - 1]
+                        prev_low = df_m3["low"].iloc[i - 1]
+                        prev_high = df_m3["high"].iloc[i - 1]
+                        prev_range = prev_high - prev_low if prev_high > prev_low else 0.0001
+                        if (prev_close - prev_low) / prev_range < confirm_pct:
+                            remaining_fvgs.append(fvg)
+                            continue  # Слабая реакция на предыдущем баре — пропускаем
+
+                    # FIXED: Entry на open СЛЕДУЮЩЕГО бара (i+1), не close текущего
+                    if i + 1 >= len(df_m3):
                         remaining_fvgs.append(fvg)
-                        continue  # Слабая реакция — пропускаем
-                    # Реакция от FVG — close выше дна зоны
+                        continue
+                    entry_price = df_m3["open"].iloc[i + 1]
+                    entry_ts = df_m3.index[i + 1]
+
                     atr_val = atr_m3.iloc[i] if i < len(atr_m3) and not np.isnan(atr_m3.iloc[i]) else (atr_h1.iloc[-1] if len(atr_h1) > 0 and not np.isnan(atr_h1.iloc[-1]) else None)
                     if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
                         remaining_fvgs.append(fvg)
                         continue
                     sl = fvg["bottom"] - atr_val * params["sl_atr_multiplier"]
-                    risk = close - sl
+                    risk = entry_price - sl
                     if risk <= 0:
                         continue
-                    tp = close + risk * params["tp_rr_ratio"]
-                    be_level = close + risk * params["be_trigger_rr"]
+                    tp = entry_price + risk * params["tp_rr_ratio"]
+                    be_level = entry_price + risk * params["be_trigger_rr"]
 
                     signals.append({
-                        "timestamp": ts,
+                        "timestamp": entry_ts,
                         "direction": "long",
-                        "entry": close,
+                        "entry": entry_price,
                         "sl": sl,
                         "tp": tp,
                         "be_level": be_level,
@@ -521,25 +545,39 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
             elif fvg["type"] == "bearish":
                 entry_level = fvg["bottom"] + (fvg["top"] - fvg["bottom"]) * entry_depth
                 if high >= entry_level and close < fvg["top"]:
-                    # Confirmation: close должен быть в нижней части свечи
-                    if confirm_pct > 0 and (high - close) / candle_range < confirm_pct:
+                    # Confirmation: ПРЕДЫДУЩИЙ бар (i-1) должен закрыться в нижней части
+                    # FIXED: проверяем бар i-1, не текущий
+                    if confirm_pct > 0 and i > 0:
+                        prev_close = df_m3["close"].iloc[i - 1]
+                        prev_low = df_m3["low"].iloc[i - 1]
+                        prev_high = df_m3["high"].iloc[i - 1]
+                        prev_range = prev_high - prev_low if prev_high > prev_low else 0.0001
+                        if (prev_high - prev_close) / prev_range < confirm_pct:
+                            remaining_fvgs.append(fvg)
+                            continue
+
+                    # FIXED: Entry на open СЛЕДУЮЩЕГО бара (i+1)
+                    if i + 1 >= len(df_m3):
                         remaining_fvgs.append(fvg)
-                        continue  # Слабая реакция — пропускаем
+                        continue
+                    entry_price = df_m3["open"].iloc[i + 1]
+                    entry_ts = df_m3.index[i + 1]
+
                     atr_val = atr_m3.iloc[i] if i < len(atr_m3) and not np.isnan(atr_m3.iloc[i]) else (atr_h1.iloc[-1] if len(atr_h1) > 0 and not np.isnan(atr_h1.iloc[-1]) else None)
                     if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
                         remaining_fvgs.append(fvg)
                         continue
                     sl = fvg["top"] + atr_val * params["sl_atr_multiplier"]
-                    risk = sl - close
+                    risk = sl - entry_price
                     if risk <= 0:
                         continue
-                    tp = close - risk * params["tp_rr_ratio"]
-                    be_level = close - risk * params["be_trigger_rr"]
+                    tp = entry_price - risk * params["tp_rr_ratio"]
+                    be_level = entry_price - risk * params["be_trigger_rr"]
 
                     signals.append({
-                        "timestamp": ts,
+                        "timestamp": entry_ts,
                         "direction": "short",
-                        "entry": close,
+                        "entry": entry_price,
                         "sl": sl,
                         "tp": tp,
                         "be_level": be_level,

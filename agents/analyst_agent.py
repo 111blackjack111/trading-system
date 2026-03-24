@@ -182,7 +182,7 @@ def run_analysis(consecutive_reverts=0, blacklist_info="none"):
     print("[Analyst] Running meta-analysis via Claude CLI...")
 
     result = subprocess.run(
-        ["claude", "-p", "--output-format", "text"],
+        ["claude", "-p", "--output-format", "text", "--model", "opus"],
         input=prompt,
         capture_output=True, text=True, timeout=180,
         cwd=os.path.join(os.path.dirname(__file__), ".."),

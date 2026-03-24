@@ -32,7 +32,15 @@ RESULTS_TSV = os.path.join(RESULTS_DIR, "results.tsv")
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
-TIMEOUT_BACKTEST = 1200  # 20 минут макс на бэктест
+TIMEOUT_BACKTEST = 3600  # 60 минут макс (5 лет × 12 инструментов = тяжёлый бэктест)
+
+
+def is_night_mode():
+    """Ночной режим: 00:00-08:00 Kyiv (UTC+3). Opus + все инструменты + автономия."""
+    kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
+    if kyiv_hour >= 24:
+        kyiv_hour -= 24
+    return 0 <= kyiv_hour < 8
 
 # ============================================================
 # Telegram helper
@@ -151,7 +159,8 @@ def restore_snapshot():
 
 
 def check_degradation(current_score, iterations_since_analyst):
-    """Проверяет деградацию после рекомендаций AnalystAgent (через 3 итерации)."""
+    """Проверяет деградацию после рекомендаций AnalystAgent (через 3 итерации).
+    Ночью строже: 15% порог, днём: 20%."""
     if iterations_since_analyst != 3:
         return False
     if not os.path.exists(SNAPSHOT_SCORE_PATH):
@@ -160,8 +169,9 @@ def check_degradation(current_score, iterations_since_analyst):
         snapshot_score = json.load(f).get("score", 0)
     if snapshot_score <= 0:
         return False
-    if current_score < snapshot_score * 0.8:
-        return True  # деградация > 20%
+    threshold = 0.85 if is_night_mode() else 0.80  # ночью строже
+    if current_score < snapshot_score * threshold:
+        return True
     return False
 
 
@@ -280,6 +290,53 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
 
 
 # ============================================================
+# Night report — отправляется утром при переходе ночь→день
+# ============================================================
+
+CORE_INSTRUMENTS = {"USD_JPY", "BTCUSDT", "EUR_GBP", "GBP_USD"}
+
+
+def send_night_report(night_results):
+    """Утренний отчёт: как ночные пары показали себя."""
+    if not night_results:
+        return
+
+    lines = ["🌙 <b>Ночной отчёт (Opus autonomous)</b>\n"]
+
+    core_lines = []
+    test_lines = []
+    for inst in sorted(night_results.keys()):
+        r = night_results[inst]
+        emoji = "✅" if r.get("total_r", 0) > 0 else "❌"
+        line = (f"  {emoji} {inst}: score={r.get('score', 0):.2f}, "
+                f"WR={r.get('winrate', 0):.0%}, "
+                f"{r.get('total_r', 0):+.0f}R, "
+                f"PF={r.get('profit_factor', 0):.1f} "
+                f"({r.get('trades', 0)} trades)")
+        if inst in CORE_INSTRUMENTS:
+            core_lines.append(line)
+        else:
+            test_lines.append(line)
+
+    lines.append("📊 <b>Core пары:</b>")
+    lines.extend(core_lines if core_lines else ["  Нет данных"])
+    lines.append("\n🧪 <b>Тестовые пары:</b>")
+    lines.extend(test_lines if test_lines else ["  Нет данных"])
+
+    # Рекомендации по тестовым
+    good_tests = [inst for inst, r in night_results.items()
+                  if inst not in CORE_INSTRUMENTS
+                  and r.get("total_r", 0) > 0
+                  and r.get("trades", 0) >= 10]
+    if good_tests:
+        lines.append(f"\n💡 <b>Кандидаты в CORE:</b> {', '.join(good_tests)}")
+        lines.append("Решение за CEO")
+
+    send_telegram("\n".join(lines))
+    print(f"  [Night Report] Sent to Telegram ({len(night_results)} instruments)")
+
+
+# ============================================================
 # Main loop
 # ============================================================
 
@@ -318,19 +375,34 @@ def run(max_iterations=100, skip_data_download=False):
     consecutive_reverts = 0
     ranges_expanded = False
     run._analyst_iter = -100  # sentinel
+    was_night = is_night_mode()
+    night_results = {}  # {instrument: {score, trades, winrate, total_r}} — для ночного отчёта
 
     # Шаг 2: Итерации
     for i in range(1, max_iterations + 1):
+        night = is_night_mode()
+        mode_str = "🌙 NIGHT (Opus+all)" if night else "☀️ DAY (Sonnet+core)"
         print(f"\n{'=' * 60}")
-        print(f"[Iteration {i}/{max_iterations}] (reverts: {consecutive_reverts}, best: {best_score:.4f})")
+        print(f"[Iteration {i}/{max_iterations}] {mode_str} (reverts: {consecutive_reverts}, best: {best_score:.4f})")
         print(f"{'=' * 60}")
 
+        # Переход ночь→день: отправить ночной отчёт
+        if was_night and not night:
+            send_night_report(night_results)
+            night_results = {}
+        was_night = night
+
         params_backup = load_params()
+
+        # Ночью: snapshot каждую итерацию (усиленная защита)
+        if night:
+            save_snapshot(params_backup, best_score)
 
         # Optimizer
         print("\n  [Optimizer] Getting suggestion...")
         try:
-            suggestion = suggest_change(params_backup)
+            blocked = {p for p, until_iter in blacklist.cooldown.items() if i < until_iter}
+            suggestion = suggest_change(params_backup, blacklisted_params=blocked)
         except Exception as e:
             print(f"  Optimizer error: {e}")
             save_experiment(i, {"param": f"error: {e}", "old_value": 0, "new_value": 0, "reasoning": str(e)},
@@ -390,6 +462,19 @@ def run(max_iterations=100, skip_data_download=False):
             (m.get("winrate", 0) for m in bt_result.get("results", {}).values() if m),
             default=0,
         )
+
+        # Трекинг ночных результатов по инструментам
+        if is_night_mode():
+            for inst, res in bt_result.get("results", {}).items():
+                if res and res.get("metrics"):
+                    m = res["metrics"]
+                    night_results[inst] = {
+                        "score": m.get("score", 0),
+                        "trades": m.get("total_trades", 0),
+                        "winrate": m.get("winrate", 0),
+                        "total_r": m.get("total_r", 0),
+                        "profit_factor": m.get("profit_factor", 0),
+                    }
 
         # === CONFLICT DETECTOR ===
         if is_anomaly(new_score, best_score, new_wr, baseline_wr):
@@ -475,9 +560,13 @@ def run(max_iterations=100, skip_data_download=False):
                 report = run_analysis(consecutive_reverts, bl_info)
                 if report:
                     # Применяем ТОЛЬКО ОДНУ рекомендацию за раз (не все сразу)
+                    # Ночью: порог 0.5 (Opus автономен), днём: 0.8 (ждём CEO)
+                    conf_threshold = 0.5 if is_night_mode() else 0.8
                     recs = report.get("recommendations", [])
-                    auto_recs = [r for r in recs if r.get("confidence", 0) >= 0.8]
-                    ceo_recs = [r for r in recs if r.get("confidence", 0) < 0.8]
+                    auto_recs = [r for r in recs if r.get("confidence", 0) >= conf_threshold]
+                    ceo_recs = [r for r in recs if r.get("confidence", 0) < conf_threshold]
+                    if is_night_mode():
+                        print(f"  [Night Mode] Confidence threshold: {conf_threshold} (auto: {len(auto_recs)}, CEO: {len(ceo_recs)})")
 
                     if auto_recs:
                         # Применяем только первую авто-рекомендацию
@@ -498,6 +587,10 @@ def run(max_iterations=100, skip_data_download=False):
                             )
             except Exception as e:
                 print(f"  [Analyst] Error: {e}")
+
+    # Отправить ночной отчёт если закончили ночью
+    if night_results:
+        send_night_report(night_results)
 
     # Финал
     print(f"\n{'=' * 60}")

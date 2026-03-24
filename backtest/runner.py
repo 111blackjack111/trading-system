@@ -66,7 +66,7 @@ def calculate_metrics(trades):
     # Sharpe ratio (annualized, assuming ~252 trading days)
     if len(pnls) > 1:
         mean_pnl = np.mean(pnls)
-        std_pnl = np.std(pnls)
+        std_pnl = np.std(pnls, ddof=1)
         sharpe = (mean_pnl / std_pnl) * math.sqrt(252) if std_pnl > 0 else 0
     else:
         sharpe = 0
