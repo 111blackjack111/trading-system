@@ -24,13 +24,14 @@ REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
 
-# Проверенные пары (всегда активны)
+# Проверенные пары (всегда активны) — только GBP_USD показывает стабильный положительный score
 CORE_INSTRUMENTS = {
-    "USD_JPY", "EUR_GBP", "GBP_USD",
+    "GBP_USD",
 }
 
-# Тестовые пары для ночного режима — все доступные, дадим второй шанс
+# Тестовые пары для ночного режима — EUR_GBP и USD_JPY на испытательном
 NIGHT_INSTRUMENTS = {
+    "EUR_GBP", "USD_JPY",
     "EUR_USD", "XAU_USD", "BTCUSDT", "NZD_JPY", "ETHUSDT",
     "BNBUSDT", "SOLUSDT", "GBP_JPY", "GER40",
 }

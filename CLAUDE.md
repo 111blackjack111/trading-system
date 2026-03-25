@@ -19,18 +19,23 @@ SMC стратегия + autoresearch оптимизация. Владелец: 
 4. Фильтры: session, volatility, OB confluence, news
 5. Сессии (UTC+3): 09-14, 15-17. Silver Bullet: 10-11, 17-18, 21-22
 
-## Score
-`score = sharpe * 0.35 + (winrate * profit_factor) * 0.35 - max_drawdown * 0.2 + 0.1`
+## Score (v4 — stable)
+```
+quality = winrate * profit_factor
+dd_penalty = max(0, dd_per_100_trades - 5.0) * 0.1
+score = sharpe * 0.25 + quality * 0.45 + 0.1 - dd_penalty
+```
+- Sharpe capped [-3, 3], dd = абсолютный R на 100 сделок (не ratio)
+- Нормальный диапазон: -2 to +2. GBP_USD baseline: +1.17
 
 ## Текущий статус (25.03.2026)
-- **Запущено на VPS**: autoresearch 100 итераций, ~30 мин/итерация (3 forex пары × 600K M3 свечей)
-- **Best score**: 0.2133 (итерация 11, forex BE trigger 1.0). Параметрическая оптимизация упёрлась — 49 revert из 55 экспериментов
-- **ACTIVE**: USD_JPY, EUR_GBP, GBP_USD (core). BTCUSDT перемещён в night-only (слишком тяжёлый — 700K свечей)
+- **РЕФАКТОРИНГ ЗАВЕРШЁН**: score v4, anomaly detector v2, чистая БД, фикс optimizer
+- **Baseline после фиксов**: GBP_USD +1.17 (48% WR), EUR_GBP -0.04 (40% WR), USD_JPY -0.19 (40% WR)
+- **ACTIVE**: USD_JPY, EUR_GBP, GBP_USD (core). BTCUSDT в night-only
 - Исключены: BNBUSDT, ETHUSDT, SOLUSDT, XAU_USD, GER40 (статистика)
-- **WR**: стабильно 34-36%, ниже порога 40%. RR 2.0-2.2 → на грани breakeven
 - **Безопасность VPS**: fail2ban + UFW (22, 8080) + SSH key-only + dashboard basic auth
 - **Watchdog v2**: cron */30, автопочинка tmux/backtest/orchestrator + Telegram алерты
-- **Следующий шаг**: дождаться 100 итераций → holdout тест → решение: продолжать SMC или переключиться на MM/funding arb
+- **Следующий шаг**: autoresearch 100 итераций с новой формулой → holdout → paper trading
 
 ## Инфраструктура на VPS
 - **Watchdog**: `agents/watchdog.py` — cron каждые 30 мин, чинит зависания, шлёт Telegram

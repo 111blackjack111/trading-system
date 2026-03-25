@@ -132,6 +132,37 @@ def get_strategy_code():
         return f.read()
 
 
+def format_tried_values(tried):
+    """Форматирует tried values для промпта оптимизатора."""
+    if not tried:
+        return "None yet."
+    lines = []
+    for param, vals in sorted(tried.items()):
+        val_strs = [f"{v:.2f}({a},s={s})" for v, a, s in vals]
+        lines.append(f"  {param}: {', '.join(val_strs)}")
+    return "\n".join(lines)
+
+
+def get_tried_values():
+    """Возвращает dict {param: [(value, action, score), ...]} из всех экспериментов."""
+    if not os.path.exists(DB_PATH):
+        return {}
+    conn = sqlite3.connect(DB_PATH)
+    tried = {}
+    try:
+        for row in conn.execute(
+            "SELECT param_changed, new_value, action, avg_score FROM experiments WHERE action != 'error' AND param_changed != 'baseline'"
+        ):
+            param, val, action, score = row
+            if param not in tried:
+                tried[param] = []
+            tried[param].append((val, action, round(score, 3)))
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+    return tried
+
+
 def compute_avg_winrate(metrics):
     """Считает средний WR по всем инструментам."""
     winrates = [m.get("winrate", 0) for m in metrics.values() if m]
@@ -178,7 +209,7 @@ def compute_param_priority(history):
     return "\n".join(lines)
 
 
-def build_prompt(params, history, metrics, trade_log, allow_code_changes=False, blacklisted_params=None):
+def build_prompt(params, history, metrics, trade_log, allow_code_changes=False, blacklisted_params=None, tried_values=None):
     """Строит промпт для Claude."""
 
     trade_log_section = ""
@@ -270,8 +301,11 @@ Your job is to improve an SMC (Smart Money Concepts) trading strategy.
 ## Last 3 Experiments
 {json.dumps(history.get("last_3", []), indent=2) if history else "None yet"}
 
-## Score Formula
-score = sharpe * 0.35 + (winrate * profit_factor) * 0.35 - max_drawdown * 0.2 + 0.1
+## Score Formula (v4 — stable)
+quality = winrate * profit_factor
+dd_penalty = max(0, dd_per_100_trades - 5.0) * 0.1
+score = sharpe * 0.25 + quality * 0.45 + 0.1 - dd_penalty
+NOTE: sharpe is capped [-3, 3]. dd is absolute R drawdown per 100 trades, not ratio.
 {code_change_section}
 ## Parameter Priority (by historical impact — start with highest)
 {compute_param_priority(history)}
@@ -279,15 +313,19 @@ score = sharpe * 0.35 + (winrate * profit_factor) * 0.35 - max_drawdown * 0.2 + 
 ## BLACKLISTED Parameters (DO NOT suggest these — they will be rejected)
 {json.dumps(list(blacklisted_params) if blacklisted_params else [], indent=2)}
 
+## Already Tried Values (DO NOT repeat exact same param+value — will be auto-rejected)
+{format_tried_values(tried_values) if tried_values else "None yet — explore freely."}
+
 ## Rules
 1. NEVER suggest blacklisted parameters — pick something else
-2. START with highest-priority parameters that haven't been exhausted
-2. Analyze the trade_log data — find PATTERNS in losses
-3. Stay within allowed ranges
-4. If a parameter was reverted 2+ times — SKIP IT, try something else
-5. Think about WHY a change might help based on SMC logic
-6. Try crypto_overrides and forex_overrides separately — they behave differently
-7. Small steps (10-20% change) are better than large jumps
+2. NEVER repeat exact values from "Already Tried Values" — pick a DIFFERENT value
+3. START with highest-priority parameters that haven't been exhausted
+4. Analyze the trade_log data — find PATTERNS in losses
+5. Stay within allowed ranges
+6. If a parameter was reverted 2+ times — SKIP IT, try something else
+7. Think about WHY a change might help based on SMC logic
+8. Try crypto_overrides and forex_overrides separately — they behave differently
+9. Small steps (10-20% change) are better than large jumps
 
 ## Response Format (JSON only)
 For parameter changes:
@@ -313,11 +351,12 @@ def suggest_change(params=None, blacklisted_params=None):
     history = get_experiment_history()
     metrics = get_current_metrics()
     trade_log = get_trade_log()
+    tried_values = get_tried_values()
 
     allow_code_changes = False
 
     prompt = build_prompt(params, history, metrics, trade_log, allow_code_changes,
-                          blacklisted_params=blacklisted_params)
+                          blacklisted_params=blacklisted_params, tried_values=tried_values)
 
     model = get_optimizer_model()
     print(f"  [Optimizer] Using model: {model} (hour={datetime.now().hour})")
