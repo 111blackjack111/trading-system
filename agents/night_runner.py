@@ -1,15 +1,18 @@
 """
 Night Runner — прогоняет A/B тесты конфигураций за ночь.
 
+Запускает бэктесты НАПРЯМУЮ (без backtest_agent) для полного контроля
+над инструментами и параметрами.
+
 Запуск:
-  TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... venv/bin/python3 agents/night_runner.py
+  TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... venv/bin/python3 -u agents/night_runner.py
 
 Тесты:
   A: FVG min_size=0.25, OB=true, NY=false  (ослабленный FVG)
   B: FVG min_size=0.35, OB=false, NY=false  (без OB confluence)
   C: FVG min_size=0.35, OB=true, NY=true    (NY сессия)
 
-Каждый тест: baseline + 20 итераций оптимизации.
+Каждый тест: baseline + 20 итераций оптимизации на ВСЕХ инструментах.
 Результаты: results/night_tests_{date}.json + Telegram.
 """
 
@@ -18,18 +21,20 @@ import sys
 import json
 import time
 import copy
+import importlib
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from strategy.base_strategy import load_params, save_params
-from agents.orchestrator_v2 import (
-    request_backtest, wait_for_backtest, save_experiment,
-    init_db, send_telegram, ParamBlacklist
-)
+from backtest.runner import run_all, calculate_metrics
+from agents.orchestrator_v2 import init_db, send_telegram, ParamBlacklist
 from agents.optimizer_agent import suggest_change
 
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
+
+# Все инструменты для тестирования
+ALL_INSTRUMENTS = ["GBP_USD", "EUR_GBP", "USD_JPY", "GBP_JPY", "EUR_USD"]
 
 # ============================================================
 # Конфигурации тестов
@@ -65,6 +70,36 @@ TESTS = {
 ITERATIONS_PER_TEST = 20
 
 
+def run_backtest_direct(params):
+    """Запускает бэктест напрямую на всех инструментах, возвращает результат."""
+    save_params(params)
+
+    # Reload strategy module to pick up param changes
+    import strategy.base_strategy as bs
+    importlib.reload(bs)
+    # Also reload runner since it imports from base_strategy at module level
+    import backtest.runner as runner_mod
+    importlib.reload(runner_mod)
+
+    raw = runner_mod.run_all(params=params, instruments_override=ALL_INSTRUMENTS)
+
+    # run_all returns {instrument: {"metrics": {...}, "trades": [...]}}
+    results = {}
+    scores = []
+    for inst, data in (raw or {}).items():
+        metrics = data.get("metrics") if isinstance(data, dict) else None
+        if metrics and metrics.get("score") is not None:
+            results[inst] = metrics
+            scores.append(metrics["score"])
+
+    avg_score = sum(scores) / len(scores) if scores else 0
+
+    return {
+        "avg_score": avg_score,
+        "results": results,
+    }
+
+
 def run_test(test_name, test_config, iterations):
     """Прогоняет один тест: baseline + N итераций оптимизации."""
     print(f"\n{'='*60}")
@@ -76,39 +111,45 @@ def run_test(test_name, test_config, iterations):
     for k, v in test_config["overrides"].items():
         base_params[k] = v
 
-    # Сохраняем params для backtest_agent
-    save_params(base_params)
-
     # Baseline
     print(f"\n[{test_name}] Baseline backtest...")
-    req_id = f"night_{test_name}_baseline"
-    request_backtest(base_params, req_id)
-    baseline_result = wait_for_backtest(req_id)
+    baseline_result = run_backtest_direct(base_params)
     baseline_score = baseline_result.get("avg_score", 0)
+
+    # Per-instrument baseline details
+    baseline_details = {}
+    total_trades = 0
+    for inst, m in baseline_result.get("results", {}).items():
+        trades = m.get("total_trades", 0)
+        total_trades += trades
+        baseline_details[inst] = {
+            "score": round(m.get("score", 0), 4),
+            "trades": trades,
+            "winrate": round(m.get("winrate", 0), 4),
+            "profit_factor": round(m.get("profit_factor", 0), 4),
+            "total_r": round(m.get("total_r", 0), 2),
+        }
 
     results = {
         "test": test_name,
         "description": test_config["description"],
         "overrides": test_config["overrides"],
         "baseline_score": baseline_score,
-        "baseline_results": baseline_result.get("results", {}),
+        "baseline_per_instrument": baseline_details,
         "best_score": baseline_score,
         "best_params": copy.deepcopy(base_params),
         "iterations": [],
-        "total_trades_baseline": sum(
-            m.get("total_trades", 0)
-            for m in baseline_result.get("results", {}).values()
-            if m
-        ),
+        "total_trades_baseline": total_trades,
     }
 
-    print(f"  Baseline: score={baseline_score:.4f}, trades={results['total_trades_baseline']}")
+    print(f"  Baseline: score={baseline_score:.4f}, trades={total_trades}")
+    for inst, d in sorted(baseline_details.items()):
+        print(f"    {inst}: score={d['score']}, trades={d['trades']}, WR={d['winrate']}")
 
     # Итерации оптимизации
     best_score = baseline_score
     best_params = copy.deepcopy(base_params)
     blacklist = ParamBlacklist()
-    consecutive_reverts = 0
 
     for i in range(1, iterations + 1):
         print(f"\n[{test_name}] Iteration {i}/{iterations} (best: {best_score:.4f})")
@@ -127,7 +168,6 @@ def run_test(test_name, test_config, iterations):
 
         # Применяем изменение
         new_params = copy.deepcopy(current_params)
-        # Поддержка nested params (forex_overrides.be_trigger_rr)
         if "." in param_name:
             parts = param_name.split(".")
             new_params[parts[0]][parts[1]] = new_value
@@ -138,47 +178,66 @@ def run_test(test_name, test_config, iterations):
         for k, v in test_config["overrides"].items():
             new_params[k] = v
 
-        save_params(new_params)
-
-        req_id = f"night_{test_name}_iter{i}"
-        request_backtest(new_params, req_id, changed_param=param_name)
-        bt_result = wait_for_backtest(req_id)
+        bt_result = run_backtest_direct(new_params)
         new_score = bt_result.get("avg_score", 0)
-        total_trades = sum(
+        iter_trades = sum(
             m.get("total_trades", 0)
             for m in bt_result.get("results", {}).values()
-            if m
         )
 
         if new_score > best_score:
             action = "keep"
             best_score = new_score
             best_params = copy.deepcopy(new_params)
-            consecutive_reverts = 0
-            print(f"  KEEP: {param_name} {old_value}->{new_value}, score {new_score:.4f} (+{new_score - baseline_score:.4f})")
+            print(f"  KEEP: {param_name} {old_value}->{new_value}, score {new_score:.4f} (+{new_score - baseline_score:.4f}), trades={iter_trades}")
         else:
             action = "revert"
-            save_params(best_params)  # откатываем
-            consecutive_reverts += 1
+            save_params(best_params)
             blacklist.record_revert(param_name, i)
-            print(f"  REVERT: {param_name} {old_value}->{new_value}, score {new_score:.4f}")
+            print(f"  REVERT: {param_name} {old_value}->{new_value}, score {new_score:.4f}, trades={iter_trades}")
 
         results["iterations"].append({
             "iter": i,
             "param": param_name,
             "old_value": old_value,
-            "new_value": new_value,
-            "score": new_score,
-            "trades": total_trades,
+            "new_value": new_value if not isinstance(new_value, float) else round(new_value, 6),
+            "score": round(new_score, 4),
+            "trades": iter_trades,
             "action": action,
         })
 
+    # Финальный бэктест с лучшими параметрами — детальные результаты
+    print(f"\n[{test_name}] Final backtest with best params...")
+    final_result = run_backtest_direct(best_params)
+    final_details = {}
+    final_trades = 0
+    for inst, m in final_result.get("results", {}).items():
+        trades = m.get("total_trades", 0)
+        final_trades += trades
+        final_details[inst] = {
+            "score": round(m.get("score", 0), 4),
+            "trades": trades,
+            "winrate": round(m.get("winrate", 0), 4),
+            "profit_factor": round(m.get("profit_factor", 0), 4),
+            "total_r": round(m.get("total_r", 0), 2),
+        }
+
     results["best_score"] = best_score
+    results["best_per_instrument"] = final_details
+    results["total_trades_best"] = final_trades
     results["best_params"] = {k: v for k, v in best_params.items()
-                               if not isinstance(v, dict)}  # skip nested for readability
+                               if not isinstance(v, dict)}
+    results["best_params_overrides"] = {
+        k: best_params.get(k) for k in ["crypto_overrides", "forex_overrides"]
+        if k in best_params
+    }
     results["improvement"] = best_score - baseline_score
     results["keeps"] = sum(1 for it in results["iterations"] if it.get("action") == "keep")
     results["reverts"] = sum(1 for it in results["iterations"] if it.get("action") == "revert")
+
+    print(f"\n  Final: score={best_score:.4f}, trades={final_trades}")
+    for inst, d in sorted(final_details.items()):
+        print(f"    {inst}: score={d['score']}, trades={d['trades']}, WR={d['winrate']}")
 
     return results
 
@@ -190,7 +249,7 @@ def main():
     date_str = datetime.now().strftime("%Y%m%d_%H%M")
     all_results = {}
 
-    send_telegram(f"🌙 Night Runner started: {len(TESTS)} tests × {ITERATIONS_PER_TEST} iterations")
+    send_telegram(f"Night Runner started: {len(TESTS)} tests x {ITERATIONS_PER_TEST} iterations\nInstruments: {', '.join(ALL_INSTRUMENTS)}")
 
     # Сохраняем оригинальные параметры для восстановления
     original_params = load_params()
@@ -203,23 +262,36 @@ def main():
             result["elapsed_minutes"] = round(elapsed, 1)
             all_results[test_name] = result
 
-            # Промежуточный Telegram
+            # Per-instrument summary for telegram
+            inst_summary = ""
+            for inst, d in sorted(result.get("best_per_instrument", {}).items()):
+                emoji = "+" if d["score"] > 0 else "-"
+                inst_summary += f"  {inst}: {d['score']:+.2f} ({d['trades']}tr, {d['winrate']:.0%}WR)\n"
+
             send_telegram(
-                f"✅ Test {test_name} done ({elapsed:.0f}m)\n"
-                f"Score: {result['baseline_score']:.4f} → {result['best_score']:.4f}\n"
-                f"Trades: {result['total_trades_baseline']}\n"
-                f"Keeps: {result['keeps']}, Reverts: {result['reverts']}"
+                f"Test {test_name} done ({elapsed:.0f}m)\n"
+                f"{result['description']}\n"
+                f"Score: {result['baseline_score']:.4f} -> {result['best_score']:.4f}\n"
+                f"Trades: {result['total_trades_baseline']} -> {result.get('total_trades_best', '?')}\n"
+                f"Keeps: {result['keeps']}, Reverts: {result['reverts']}\n\n"
+                f"{inst_summary}"
             )
 
+            # Сохраняем промежуточный результат
+            interim_file = os.path.join(RESULTS_DIR, f"night_tests_{date_str}.json")
+            with open(interim_file, "w") as f:
+                json.dump(all_results, f, indent=2, default=str)
+
     except Exception as e:
-        send_telegram(f"❌ Night Runner error: {e}")
+        import traceback
+        send_telegram(f"Night Runner error: {e}\n{traceback.format_exc()[-500:]}")
         raise
     finally:
         # Восстанавливаем оригинальные параметры
         save_params(original_params)
         print("\n[Night Runner] Original params restored.")
 
-    # Сохраняем результаты
+    # Сохраняем финальные результаты
     results_file = os.path.join(RESULTS_DIR, f"night_tests_{date_str}.json")
     with open(results_file, "w") as f:
         json.dump(all_results, f, indent=2, default=str)
@@ -227,12 +299,13 @@ def main():
     print(f"\nResults saved: {results_file}")
 
     # Финальный отчёт в Telegram
-    report = "🏁 Night Runner Complete!\n\n"
+    report = "Night Runner Complete!\n\n"
     for name, r in all_results.items():
         report += (
             f"<b>{name}</b>: {r['description']}\n"
-            f"  Score: {r['baseline_score']:.4f} → {r['best_score']:.4f} ({r['improvement']:+.4f})\n"
-            f"  Trades: {r['total_trades_baseline']} | Keeps: {r['keeps']}/{ITERATIONS_PER_TEST}\n\n"
+            f"  Score: {r['baseline_score']:.4f} -> {r['best_score']:.4f} ({r['improvement']:+.4f})\n"
+            f"  Trades: {r['total_trades_baseline']} -> {r.get('total_trades_best', '?')}\n"
+            f"  Keeps: {r['keeps']}/{ITERATIONS_PER_TEST}\n\n"
         )
     send_telegram(report)
 
