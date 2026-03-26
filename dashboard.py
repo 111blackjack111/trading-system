@@ -1,23 +1,30 @@
 """
-Modern Trading System Dashboard v4.
+Modern Trading System Dashboard v5.
 http://server:8080
-Auto-refreshes every 10s via JS fetch (no page reload).
+Auto-refreshes every 30s via JS fetch (no page reload).
 Endpoints: GET / (HTML), GET /api/data (JSON).
 
-v4 additions:
-  - Holdout status section
-  - Equity curve (cumulative R)
-  - Consecutive reverts counter
-  - Time until next iteration countdown
-  - ImpulseAgent progress section
+v5 additions:
+  - All data sources cached with 30s TTL
+  - ThreadingHTTPServer for non-blocking
+  - Single DB query for scores + equity curve
+  - Iteration speed & ETA
+  - Keep/Revert ratio (last 10 / last 50)
+  - Per-instrument scores in table
+  - MFE/MAE section (from exit_reason_breakdown avg_pnl)
+  - Night/Day mode indicator
+  - Last change detail card
 """
 
 import os
 import json
 import sqlite3
 import subprocess
+import base64
+import time as _time
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timedelta
+from socketserver import ThreadingMixIn
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, parse_qs
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,12 +45,28 @@ TIME_RANGE_MAP = {
     "7d": timedelta(days=7),
 }
 
+# --------------- universal cache ---------------
+_cache = {}
+_CACHE_TTL = 30  # seconds
+
+
+def _cached(key, fn):
+    now = _time.time()
+    if key in _cache and now - _cache[key][1] < _CACHE_TTL:
+        return _cache[key][0]
+    try:
+        result = fn()
+    except Exception:
+        return _cache.get(key, [({}, 0)])[0]
+    _cache[key] = (result, now)
+    return result
+
 
 def get_last_experiment_time():
     """Return the timestamp of the most recent experiment, or None."""
-    if not os.path.exists(DB_PATH):
-        return None
-    try:
+    def _inner():
+        if not os.path.exists(DB_PATH):
+            return None
         conn = sqlite3.connect(DB_PATH)
         row = conn.execute(
             "SELECT timestamp FROM experiments ORDER BY id DESC LIMIT 1"
@@ -51,21 +74,14 @@ def get_last_experiment_time():
         conn.close()
         if row and row[0]:
             ts = row[0].replace("T", " ")
-            # handle microseconds
             if "." in ts:
                 return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
             return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
-    return None
+        return None
+    return _cached("last_experiment_time", _inner)
 
 
 def get_cutoff_timestamp(time_range):
-    """Return ISO-formatted cutoff timestamp string, or None for 'all'.
-
-    Uses the most recent experiment as reference point (not now()),
-    so filters work even when the system hasn't run for days.
-    """
     if not time_range or time_range == "all":
         return None
     delta = TIME_RANGE_MAP.get(time_range)
@@ -76,12 +92,16 @@ def get_cutoff_timestamp(time_range):
     return cutoff.strftime("%Y-%m-%d %H:%M:%S")
 
 
-# --------------- data fetching (unchanged logic) ---------------
+# --------------- data fetching ---------------
 
 def get_tmux_sessions():
+    return _cached("tmux_sessions", _get_tmux_sessions)
+
+
+def _get_tmux_sessions():
     try:
         out = subprocess.check_output(
-            ["tmux", "list-sessions"], stderr=subprocess.DEVNULL, text=True
+            ["tmux", "list-sessions"], stderr=subprocess.DEVNULL, text=True, timeout=5
         )
         sessions = {}
         for line in out.strip().split("\n"):
@@ -93,10 +113,14 @@ def get_tmux_sessions():
 
 
 def get_agent_activity(name, lines=5):
+    return _cached(f"activity_{name}", lambda: _get_agent_activity(name, lines))
+
+
+def _get_agent_activity(name, lines=5):
     try:
         out = subprocess.check_output(
             ["tmux", "capture-pane", "-t", name, "-p", "-S", f"-{lines}"],
-            stderr=subprocess.DEVNULL, text=True,
+            stderr=subprocess.DEVNULL, text=True, timeout=5,
         )
         result = [l for l in out.strip().split("\n") if l.strip()]
         return result if result else ["idle"]
@@ -105,9 +129,13 @@ def get_agent_activity(name, lines=5):
 
 
 def get_process_info():
+    return _cached("process_info", _get_process_info)
+
+
+def _get_process_info():
     try:
         out = subprocess.check_output(
-            ["ps", "aux"], stderr=subprocess.DEVNULL, text=True
+            ["ps", "aux"], stderr=subprocess.DEVNULL, text=True, timeout=5
         )
         procs = {}
         for line in out.split("\n"):
@@ -141,6 +169,11 @@ def get_process_info():
 
 
 def get_experiments(limit=15, cutoff=None):
+    cache_key = f"experiments_{limit}_{cutoff}"
+    return _cached(cache_key, lambda: _get_experiments(limit, cutoff))
+
+
+def _get_experiments(limit=15, cutoff=None):
     if not os.path.exists(DB_PATH):
         return []
     try:
@@ -150,7 +183,7 @@ def get_experiments(limit=15, cutoff=None):
             rows = conn.execute(
                 "SELECT iteration, param_changed, old_value, new_value, "
                 "round(avg_score,4) as avg_score, round(avg_winrate,4) as avg_winrate, "
-                "total_trades, best_instrument, action, timestamp "
+                "total_trades, best_instrument, action, timestamp, notes "
                 "FROM experiments WHERE timestamp >= ? ORDER BY id DESC LIMIT ?",
                 (cutoff, limit),
             ).fetchall()
@@ -158,7 +191,7 @@ def get_experiments(limit=15, cutoff=None):
             rows = conn.execute(
                 "SELECT iteration, param_changed, old_value, new_value, "
                 "round(avg_score,4) as avg_score, round(avg_winrate,4) as avg_winrate, "
-                "total_trades, best_instrument, action, timestamp "
+                "total_trades, best_instrument, action, timestamp, notes "
                 "FROM experiments ORDER BY id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -168,10 +201,15 @@ def get_experiments(limit=15, cutoff=None):
         return []
 
 
-def get_all_scores(cutoff=None):
-    """Return all (iteration, avg_score, action) for the chart."""
+def get_all_scores_and_equity(cutoff=None):
+    """Single DB query for both score history and equity curve data."""
+    cache_key = f"scores_equity_{cutoff}"
+    return _cached(cache_key, lambda: _get_all_scores_and_equity(cutoff))
+
+
+def _get_all_scores_and_equity(cutoff=None):
     if not os.path.exists(DB_PATH):
-        return []
+        return {"scores": [], "equity": []}
     try:
         conn = sqlite3.connect(DB_PATH)
         if cutoff:
@@ -185,12 +223,35 @@ def get_all_scores(cutoff=None):
                 "SELECT iteration, round(avg_score,4), action FROM experiments ORDER BY id"
             ).fetchall()
         conn.close()
-        return [{"iter": r[0], "score": r[1] or 0, "action": r[2]} for r in rows]
+
+        scores = [{"iter": r[0], "score": r[1] or 0, "action": r[2]} for r in rows]
+
+        # Build equity curve from same data
+        curve = []
+        cumulative_r = 0.0
+        prev_score = 0.0
+        for r in rows:
+            iteration = r[0]
+            score = r[1] or 0.0
+            action = r[2]
+            if action == "keep":
+                delta = score - prev_score if prev_score else score * 0.1
+                cumulative_r += max(delta, 0.01)
+            elif action == "revert":
+                cumulative_r -= 0.02
+            prev_score = score
+            curve.append({"iter": iteration, "cumR": round(cumulative_r, 4)})
+
+        return {"scores": scores, "equity": curve}
     except Exception:
-        return []
+        return {"scores": [], "equity": []}
 
 
 def get_experiment_stats():
+    return _cached("experiment_stats", _get_experiment_stats)
+
+
+def _get_experiment_stats():
     if not os.path.exists(DB_PATH):
         return {}
     try:
@@ -216,6 +277,10 @@ def get_experiment_stats():
 
 
 def get_trade_log():
+    return _cached("trade_log", _get_trade_log)
+
+
+def _get_trade_log():
     try:
         from db.db_manager import get_latest_trade_log
         result = get_latest_trade_log()
@@ -231,6 +296,10 @@ def get_trade_log():
 
 
 def get_suggestion():
+    return _cached("suggestion", _get_suggestion)
+
+
+def _get_suggestion():
     try:
         from db.db_manager import get_latest_suggestion
         result = get_latest_suggestion()
@@ -245,6 +314,10 @@ def get_suggestion():
 
 
 def get_params():
+    return _cached("params", _get_params)
+
+
+def _get_params():
     if not os.path.exists(PARAMS_PATH):
         return {}
     try:
@@ -255,6 +328,10 @@ def get_params():
 
 
 def get_last_log_lines(path, n=5):
+    return _cached(f"log_{path}_{n}", lambda: _get_last_log_lines(path, n))
+
+
+def _get_last_log_lines(path, n=5):
     if not os.path.exists(path):
         return []
     try:
@@ -269,11 +346,15 @@ def get_last_log_lines(path, n=5):
 
 
 def get_runtime_files():
-    """Get latest instrument metrics from DB."""
+    return _cached("runtime_files", _get_runtime_files)
+
+
+def _get_runtime_files():
+    """Get latest instrument metrics from DB, fall back to files."""
+    result = {}
     try:
         from db.db_manager import get_latest_instrument_metrics
         metrics = get_latest_instrument_metrics()
-        result = {}
         for m in metrics:
             key = f"metrics_{m['instrument']}"
             result[key] = {
@@ -286,9 +367,30 @@ def get_runtime_files():
                 "max_drawdown": m["max_drawdown"],
                 "iteration": m["iteration"],
             }
-        return result
     except Exception:
-        return {}
+        pass
+    # Fall back to reading metrics files directly if DB returned nothing
+    if not result and os.path.exists(RUNTIME_DIR):
+        for fname in os.listdir(RUNTIME_DIR):
+            if fname.startswith("metrics_") and fname.endswith(".json"):
+                try:
+                    fpath = os.path.join(RUNTIME_DIR, fname)
+                    with open(fpath) as f:
+                        data = json.load(f)
+                    inst = fname.replace("metrics_", "").replace(".json", "")
+                    result[f"metrics_{inst}"] = {
+                        "instrument": inst,
+                        "score": data.get("score", 0),
+                        "winrate": data.get("winrate", 0),
+                        "total_trades": data.get("total_trades", 0),
+                        "profit_factor": data.get("profit_factor", 0),
+                        "sharpe": data.get("sharpe", 0),
+                        "max_drawdown": data.get("max_drawdown", 0),
+                        "iteration": data.get("iteration", 0),
+                    }
+                except Exception:
+                    pass
+    return result
 
 
 def format_age(seconds):
@@ -302,9 +404,13 @@ def format_age(seconds):
         return f"{seconds // 86400}d ago"
 
 
-# --------------- NEW: holdout status ---------------
+# --------------- holdout status ---------------
 
 def get_holdout_status():
+    return _cached("holdout_status", _get_holdout_status)
+
+
+def _get_holdout_status():
     try:
         from db.db_manager import get_latest_holdout
         result = get_latest_holdout()
@@ -312,53 +418,16 @@ def get_holdout_status():
             return {"status": "completed", "results": result["data"]}
     except Exception:
         pass
-    return {"status": "reserved", "message": "Holdout: \u0437\u0430\u0440\u0435\u0437\u0435\u0440\u0432\u0438\u0440\u043e\u0432\u0430\u043d (\u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 2 \u043c\u0435\u0441)"}
+    return {"status": "reserved", "message": "\u0417\u0430\u0440\u0435\u0437\u0435\u0440\u0432\u0438\u0440\u043e\u0432\u0430\u043d (\u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0435 2 \u043c\u0435\u0441)"}
 
 
-# --------------- NEW: equity curve data ---------------
-
-def get_equity_curve(cutoff=None):
-    """Calculate cumulative R from experiments DB (score deltas for keeps)."""
-    if not os.path.exists(DB_PATH):
-        return []
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        if cutoff:
-            rows = conn.execute(
-                "SELECT iteration, avg_score, action FROM experiments "
-                "WHERE timestamp >= ? ORDER BY id",
-                (cutoff,),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT iteration, avg_score, action FROM experiments ORDER BY id"
-            ).fetchall()
-        conn.close()
-        if not rows:
-            return []
-        curve = []
-        cumulative_r = 0.0
-        prev_score = 0.0
-        for r in rows:
-            iteration = r[0]
-            score = r[1] or 0.0
-            action = r[2]
-            if action == "keep":
-                delta = score - prev_score if prev_score else score * 0.1
-                cumulative_r += max(delta, 0.01)
-            elif action == "revert":
-                cumulative_r -= 0.02
-            # baseline doesn't change cumulative
-            prev_score = score
-            curve.append({"iter": iteration, "cumR": round(cumulative_r, 4)})
-        return curve
-    except Exception:
-        return []
-
-
-# --------------- NEW: consecutive reverts ---------------
+# --------------- consecutive reverts ---------------
 
 def get_consecutive_reverts():
+    return _cached("consecutive_reverts", _get_consecutive_reverts)
+
+
+def _get_consecutive_reverts():
     if not os.path.exists(DB_PATH):
         return 0
     try:
@@ -378,10 +447,13 @@ def get_consecutive_reverts():
         return 0
 
 
-# --------------- NEW: next iteration timing ---------------
+# --------------- next iteration timing ---------------
 
 def get_next_iteration_info():
-    """Return last experiment timestamp and estimated seconds until next."""
+    return _cached("next_iteration_info", _get_next_iteration_info)
+
+
+def _get_next_iteration_info():
     if not os.path.exists(DB_PATH):
         return {"last_ts": None, "avg_duration": 720, "seconds_until": None}
     try:
@@ -394,7 +466,6 @@ def get_next_iteration_info():
             return {"last_ts": None, "avg_duration": 720, "seconds_until": None}
 
         last_ts_str = rows[0][0]
-        # Parse timestamp
         try:
             last_dt = datetime.strptime(last_ts_str, "%Y-%m-%d %H:%M:%S")
         except Exception:
@@ -403,8 +474,7 @@ def get_next_iteration_info():
             except Exception:
                 return {"last_ts": last_ts_str, "avg_duration": 720, "seconds_until": None}
 
-        # Calculate average duration between iterations
-        avg_duration = 720  # default 12 min
+        avg_duration = 720
         if len(rows) >= 2:
             try:
                 timestamps = []
@@ -420,7 +490,7 @@ def get_next_iteration_info():
                     deltas = []
                     for i in range(len(timestamps) - 1):
                         d = (timestamps[i] - timestamps[i + 1]).total_seconds()
-                        if 60 < d < 7200:  # between 1 min and 2 hours
+                        if 60 < d < 7200:
                             deltas.append(d)
                     if deltas:
                         avg_duration = int(sum(deltas) / len(deltas))
@@ -439,9 +509,183 @@ def get_next_iteration_info():
         return {"last_ts": None, "avg_duration": 720, "seconds_until": None}
 
 
-# --------------- NEW: impulse agent progress ---------------
+# --------------- iteration speed & ETA ---------------
+
+def get_iteration_speed():
+    return _cached("iteration_speed", _get_iteration_speed)
+
+
+def _get_iteration_speed():
+    if not os.path.exists(DB_PATH):
+        return {"iters_per_hour": 0, "eta_hours": None, "total": 0, "target": 100}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT timestamp FROM experiments ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        total_row = conn.execute("SELECT COUNT(*) FROM experiments").fetchone()
+        conn.close()
+
+        total = total_row[0] if total_row else 0
+        target = 100
+
+        if len(rows) < 2:
+            return {"iters_per_hour": 0, "eta_hours": None, "total": total, "target": target}
+
+        timestamps = []
+        for r in rows:
+            try:
+                timestamps.append(datetime.strptime(r[0], "%Y-%m-%d %H:%M:%S"))
+            except Exception:
+                try:
+                    timestamps.append(datetime.fromisoformat(r[0]))
+                except Exception:
+                    pass
+
+        if len(timestamps) < 2:
+            return {"iters_per_hour": 0, "eta_hours": None, "total": total, "target": target}
+
+        # Time span between oldest and newest of last 10
+        span_seconds = (timestamps[0] - timestamps[-1]).total_seconds()
+        if span_seconds <= 0:
+            return {"iters_per_hour": 0, "eta_hours": None, "total": total, "target": target}
+
+        iters_per_hour = round((len(timestamps) - 1) / (span_seconds / 3600), 1)
+        remaining = max(0, target - total)
+        eta_hours = round(remaining / iters_per_hour, 1) if iters_per_hour > 0 else None
+
+        return {
+            "iters_per_hour": iters_per_hour,
+            "eta_hours": eta_hours,
+            "total": total,
+            "target": target,
+        }
+    except Exception:
+        return {"iters_per_hour": 0, "eta_hours": None, "total": 0, "target": 100}
+
+
+# --------------- keep/revert ratio ---------------
+
+def get_keep_revert_ratio():
+    return _cached("keep_revert_ratio", _get_keep_revert_ratio)
+
+
+def _get_keep_revert_ratio():
+    if not os.path.exists(DB_PATH):
+        return {"last10_keep_pct": 0, "last50_keep_pct": 0}
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = conn.execute(
+            "SELECT action FROM experiments ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+
+        actions = [r[0] for r in rows]
+        last10 = actions[:10]
+        last50 = actions[:50]
+
+        def keep_pct(lst):
+            relevant = [a for a in lst if a in ("keep", "revert")]
+            if not relevant:
+                return 0
+            return round(sum(1 for a in relevant if a == "keep") / len(relevant) * 100, 1)
+
+        return {
+            "last10_keep_pct": keep_pct(last10),
+            "last50_keep_pct": keep_pct(last50),
+        }
+    except Exception:
+        return {"last10_keep_pct": 0, "last50_keep_pct": 0}
+
+
+# --------------- last change detail ---------------
+
+def get_last_change_detail():
+    return _cached("last_change_detail", _get_last_change_detail)
+
+
+def _get_last_change_detail():
+    if not os.path.exists(DB_PATH):
+        return None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        row = conn.execute(
+            "SELECT iteration, param_changed, old_value, new_value, action, notes, "
+            "round(avg_score,4) as avg_score, timestamp "
+            "FROM experiments ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        notes = row[5] or ""
+        if len(notes) > 150:
+            notes = notes[:147] + "..."
+        return {
+            "iteration": row[0],
+            "param": row[1] or "baseline",
+            "old_value": row[2],
+            "new_value": row[3],
+            "action": row[4],
+            "notes": notes,
+            "score": row[6] or 0,
+            "timestamp": row[7],
+        }
+    except Exception:
+        return None
+
+
+# --------------- MFE/MAE from exit breakdown ---------------
+
+def get_mfe_mae_data():
+    """Extract MFE/MAE-like data from exit_reason_breakdown avg_pnl."""
+    return _cached("mfe_mae_data", _get_mfe_mae_data)
+
+
+def _get_mfe_mae_data():
+    trade_log = get_trade_log()
+    if not trade_log:
+        return None
+    exit_bd = trade_log.get("exit_reason_breakdown", {})
+    if not exit_bd:
+        return None
+
+    tp_data = exit_bd.get("tp", {})
+    be_data = exit_bd.get("be", {})
+    sl_data = exit_bd.get("sl", {})
+
+    return {
+        "tp_avg_pnl": round(tp_data.get("avg_pnl", 0), 3),
+        "tp_count": tp_data.get("count", 0),
+        "be_avg_pnl": round(be_data.get("avg_pnl", 0), 3),
+        "be_count": be_data.get("count", 0),
+        "sl_avg_pnl": round(sl_data.get("avg_pnl", 0), 3),
+        "sl_count": sl_data.get("count", 0),
+        "has_data": True,
+    }
+
+
+# --------------- night/day mode ---------------
+
+def get_day_night_mode():
+    """Kyiv = UTC+2. Night = 00:00-08:00 Kyiv time."""
+    kyiv_tz = timezone(timedelta(hours=2))
+    kyiv_now = datetime.now(kyiv_tz)
+    hour = kyiv_now.hour
+    is_night = 0 <= hour < 8
+    return {
+        "is_night": is_night,
+        "kyiv_time": kyiv_now.strftime("%H:%M"),
+        "label": "Night / Opus" if is_night else "Day / Sonnet",
+    }
+
+
+# --------------- impulse agent progress ---------------
 
 def get_impulse_progress():
+    return _cached("impulse_progress", _get_impulse_progress)
+
+
+def _get_impulse_progress():
     result = {
         "coins_analyzed": 0,
         "patterns_found": 0,
@@ -449,23 +693,19 @@ def get_impulse_progress():
         "status": "no_data",
     }
 
-    # Check impulse_patterns.db
     if os.path.exists(IMPULSE_DB_PATH):
         try:
             conn = sqlite3.connect(IMPULSE_DB_PATH)
-            # Count distinct coins
             try:
                 row = conn.execute("SELECT COUNT(DISTINCT symbol) FROM impulse_events").fetchone()
                 result["coins_analyzed"] = row[0] if row else 0
             except Exception:
                 pass
-            # Count patterns
             try:
                 row = conn.execute("SELECT COUNT(*) FROM impulse_events").fetchone()
                 result["patterns_found"] = row[0] if row else 0
             except Exception:
                 pass
-            # Last alert
             try:
                 row = conn.execute(
                     "SELECT symbol, timestamp FROM impulse_events ORDER BY timestamp DESC LIMIT 1"
@@ -479,7 +719,6 @@ def get_impulse_progress():
         except Exception:
             pass
 
-    # Also check runtime for impulse files
     if os.path.exists(RUNTIME_DIR):
         for f in os.listdir(RUNTIME_DIR):
             if "impulse" in f.lower():
@@ -513,15 +752,24 @@ def build_api_data(time_range="all"):
     params = get_params()
     procs = get_process_info()
     runtime_files = get_runtime_files()
-    all_scores = get_all_scores(cutoff=cutoff)
     orch_lines = get_last_log_lines(ORCH_LOG, 5)
 
-    # NEW data
+    # Single query for scores + equity
+    scores_equity = get_all_scores_and_equity(cutoff=cutoff)
+    all_scores = scores_equity["scores"]
+    equity_curve = scores_equity["equity"]
+
     holdout = get_holdout_status()
-    equity_curve = get_equity_curve(cutoff=cutoff)
     consecutive_reverts = get_consecutive_reverts()
     next_iter = get_next_iteration_info()
     impulse_progress = get_impulse_progress()
+
+    # NEW v5
+    iteration_speed = get_iteration_speed()
+    keep_revert_ratio = get_keep_revert_ratio()
+    last_change = get_last_change_detail()
+    mfe_mae = get_mfe_mae_data()
+    day_night = get_day_night_mode()
 
     agents = []
     for name, label in [
@@ -550,7 +798,6 @@ def build_api_data(time_range="all"):
 
     workers = procs.get("workers", {})
 
-    # Top-level stats
     total = exp_stats.get("total", 0)
     kept = exp_stats.get("kept", 0)
     reverted = exp_stats.get("reverted", 0)
@@ -563,7 +810,6 @@ def build_api_data(time_range="all"):
     best_instrument = "N/A"
 
     if experiments:
-        keeps = [e for e in experiments if e["action"] == "keep"]
         last_exp = experiments[0]
         current_score = last_exp.get("avg_score") or 0
         current_wr = last_exp.get("avg_winrate") or 0
@@ -579,6 +825,13 @@ def build_api_data(time_range="all"):
     tl_wr = 0
     tl_total = 0
 
+    # Build instrument score map from runtime_files
+    inst_score_map = {}
+    for key, val in runtime_files.items():
+        if key.startswith("metrics_") and isinstance(val, dict):
+            inst_name = val.get("instrument", key.replace("metrics_", ""))
+            inst_score_map[inst_name] = val.get("score", None)
+
     if trade_log:
         tl_wr = trade_log.get("overall_winrate", 0)
         tl_total = trade_log.get("total_trades", 0)
@@ -592,6 +845,7 @@ def build_api_data(time_range="all"):
                 "winrate": data["winrate"],
                 "total_r": data["total_r"],
                 "trades": data["total_trades"],
+                "score": inst_score_map.get(inst),
             })
 
         for sess, data in sorted(
@@ -643,12 +897,18 @@ def build_api_data(time_range="all"):
         "params": params,
         "orch_log": orch_lines,
         "runtime_files": runtime_files,
-        # NEW fields
+        # v4 fields
         "holdout": holdout,
         "equity_curve": equity_curve,
         "consecutive_reverts": consecutive_reverts,
         "next_iteration": next_iter,
         "impulse_progress": impulse_progress,
+        # v5 fields
+        "iteration_speed": iteration_speed,
+        "keep_revert_ratio": keep_revert_ratio,
+        "last_change": last_change,
+        "mfe_mae": mfe_mae,
+        "day_night": day_night,
     }
 
 
@@ -679,6 +939,9 @@ a{color:var(--accent);text-decoration:none}
 .header h1{font-size:1.35rem;font-weight:600;color:var(--text-bright);display:flex;align-items:center;gap:10px}
 .header h1 .dot{width:8px;height:8px;border-radius:50%;background:var(--green);display:inline-block;animation:pulse 2s infinite}
 .header-right{display:flex;align-items:center;gap:16px;color:var(--text-dim);font-size:.85rem}
+.mode-badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:8px;font-size:.8rem;font-weight:600}
+.mode-badge.night{background:rgba(88,166,255,.12);color:var(--accent);border:1px solid rgba(88,166,255,.25)}
+.mode-badge.day{background:rgba(210,153,34,.12);color:var(--yellow);border:1px solid rgba(210,153,34,.25)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 
 /* ---- stat cards ---- */
@@ -690,8 +953,15 @@ a{color:var(--accent);text-decoration:none}
 .stat-card .sub{font-size:.78rem;color:var(--text-dim);margin-top:4px}
 .stat-card .value.green{color:var(--green)}.stat-card .value.red{color:var(--red)}.stat-card .value.accent{color:var(--accent)}.stat-card .value.yellow{color:var(--yellow)}
 
-/* ---- mini stat row (reverts + next iter + holdout) ---- */
-.mini-stat-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:20px}
+/* ---- last change detail card ---- */
+.last-change-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:16px 20px;box-shadow:var(--card-shadow);margin-bottom:20px}
+.last-change-header{display:flex;align-items:center;gap:12px;margin-bottom:8px;flex-wrap:wrap}
+.last-change-param{font-size:1.05rem;font-weight:700;color:var(--accent)}
+.last-change-change{font-size:.9rem;color:var(--text-bright)}
+.last-change-notes{font-size:.82rem;color:var(--text-dim);margin-top:6px;line-height:1.5;font-style:italic}
+
+/* ---- mini stat row ---- */
+.mini-stat-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:20px}
 .mini-card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;box-shadow:var(--card-shadow);display:flex;align-items:center;gap:14px}
 .mini-card .mini-icon{font-size:1.8rem;line-height:1}
 .mini-card .mini-content{flex:1}
@@ -702,6 +972,7 @@ a{color:var(--accent);text-decoration:none}
 /* ---- grid layout ---- */
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
 .grid-3{display:grid;grid-template-columns:2fr 1fr 1fr;gap:14px;margin-bottom:14px}
+.grid-2-1{display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:14px}
 .full-w{margin-bottom:14px}
 
 /* ---- panel (card) ---- */
@@ -759,8 +1030,15 @@ a{color:var(--accent);text-decoration:none}
 .log-line{font-family:'SF Mono',Menlo,Consolas,monospace;font-size:.78rem;padding:2px 0;color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .log-line.err{color:var(--red)}.log-line.keep{color:var(--green)}.log-line.rev{color:var(--red)}
 
+/* ---- MFE/MAE cards ---- */
+.mfe-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.mfe-item{text-align:center;padding:12px 8px;border-radius:8px;background:rgba(88,166,255,.04)}
+.mfe-item .mfe-val{font-size:1.3rem;font-weight:700}
+.mfe-item .mfe-label{font-size:.72rem;text-transform:uppercase;color:var(--text-dim);margin-top:4px}
+.mfe-item .mfe-sub{font-size:.72rem;color:var(--text-dim);margin-top:2px}
+
 /* ---- responsive ---- */
-@media(max-width:900px){.stat-row{grid-template-columns:repeat(2,1fr)}.grid-2,.grid-3,.mini-stat-row{grid-template-columns:1fr}}
+@media(max-width:900px){.stat-row{grid-template-columns:repeat(2,1fr)}.grid-2,.grid-3,.grid-2-1,.mini-stat-row{grid-template-columns:1fr}}
 @media(max-width:500px){.stat-row{grid-template-columns:1fr}.header{flex-direction:column;align-items:flex-start}}
 
 /* ---- time range filter bar ---- */
@@ -783,7 +1061,7 @@ a{color:var(--accent);text-decoration:none}
 
 <!-- header -->
 <div class="header">
-  <h1><span class="dot"></span> Trading System</h1>
+  <h1><span class="dot"></span> Trading System <span id="mode-badge" class="mode-badge day"></span></h1>
   <div class="header-right">
     <span id="hdr-time">--</span>
     <span id="hdr-iter">-- experiments</span>
@@ -808,7 +1086,19 @@ a{color:var(--accent);text-decoration:none}
   <div class="stat-card"><div class="label">Best Instrument</div><div class="value accent" id="sc-best">--</div><div class="sub" id="sc-best-sub">&nbsp;</div></div>
 </div>
 
-<!-- NEW: mini stat row: reverts counter + next iteration + holdout -->
+<!-- last change detail -->
+<div class="last-change-card" id="last-change-card" style="display:none">
+  <div class="last-change-header">
+    <span style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim)">Last Change</span>
+    <span class="badge" id="lc-badge">--</span>
+    <span class="last-change-param" id="lc-param">--</span>
+    <span class="last-change-change" id="lc-change">--</span>
+    <span style="font-size:.78rem;color:var(--text-dim)" id="lc-score">--</span>
+  </div>
+  <div class="last-change-notes" id="lc-notes"></div>
+</div>
+
+<!-- mini stat row: reverts + next iter + holdout + speed + keep ratio -->
 <div class="mini-stat-row">
   <div class="mini-card" id="reverts-card">
     <div class="mini-icon" id="reverts-icon">&#x21BA;</div>
@@ -824,6 +1114,22 @@ a{color:var(--accent);text-decoration:none}
       <div class="mini-label">Next Iteration</div>
       <div class="mini-value" id="next-iter-value">--</div>
       <div class="mini-sub" id="next-iter-sub">&nbsp;</div>
+    </div>
+  </div>
+  <div class="mini-card" id="speed-card">
+    <div class="mini-icon">&#x26A1;</div>
+    <div class="mini-content">
+      <div class="mini-label">Iteration Speed</div>
+      <div class="mini-value" id="speed-value">--</div>
+      <div class="mini-sub" id="speed-sub">&nbsp;</div>
+    </div>
+  </div>
+  <div class="mini-card" id="keep-ratio-card">
+    <div class="mini-icon">&#x2705;</div>
+    <div class="mini-content">
+      <div class="mini-label">Keep Ratio</div>
+      <div class="mini-value" id="keep-ratio-value">--</div>
+      <div class="mini-sub" id="keep-ratio-sub">&nbsp;</div>
     </div>
   </div>
   <div class="mini-card" id="holdout-card">
@@ -852,7 +1158,13 @@ a{color:var(--accent);text-decoration:none}
 <div class="grid-3">
   <div class="panel"><div class="panel-head">Instruments</div><div class="panel-body" id="instruments-area"></div></div>
   <div class="panel"><div class="panel-head">Sessions</div><div class="panel-body" id="sessions-area"></div></div>
-  <div class="panel"><div class="panel-head">Exit Breakdown</div><div class="panel-body" id="exits-area"></div></div>
+  <div class="panel">
+    <div class="panel-head">Exit Breakdown</div>
+    <div class="panel-body">
+      <div id="exits-area"></div>
+      <div id="mfe-area" style="margin-top:14px"></div>
+    </div>
+  </div>
 </div>
 
 <!-- experiments table -->
@@ -874,7 +1186,7 @@ a{color:var(--accent);text-decoration:none}
 
 const $ = s => document.getElementById(s);
 let prev = null;
-let nextIterCountdown = null; // seconds remaining, updated by server + JS tick
+let nextIterCountdown = null;
 let currentTimeRange = 'all';
 
 // Time range filter buttons
@@ -905,7 +1217,6 @@ function renderChart(data){
   function sx(i){return PAD+i*xStep;}
   function sy(v){return PADT+(1-(v-mn)/rng)*(H-PADT-PADB);}
 
-  // Build path
   let path='M';
   let areaPath='M';
   const dots=[];
@@ -915,40 +1226,36 @@ function renderChart(data){
     if(i===0) areaPath+=x.toFixed(1)+','+(H-PADB);
     areaPath+=' L'+x.toFixed(1)+','+y.toFixed(1);
     const clr=p.action==='keep'?'var(--green)':p.action==='revert'?'var(--red)':'var(--accent)';
-    dots.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3" fill="${clr}" opacity=".85"><title>#${p.iter} score=${p.score}</title></circle>`);
+    dots.push('<circle cx="'+x.toFixed(1)+'" cy="'+y.toFixed(1)+'" r="3" fill="'+clr+'" opacity=".85"><title>#'+p.iter+' score='+p.score+'</title></circle>');
   });
   areaPath+=' L'+sx(n-1).toFixed(1)+','+(H-PADB)+' Z';
 
-  // Y axis labels (5 ticks)
   let yLabels='';
   for(let i=0;i<=4;i++){
     const v=mn+rng*(i/4);
     const y=sy(v);
-    yLabels+=`<text x="${PAD-6}" y="${y+4}" text-anchor="end" fill="var(--text-dim)" font-size="10">${v.toFixed(2)}</text>`;
-    yLabels+=`<line x1="${PAD}" x2="${W-PADR}" y1="${y}" y2="${y}" stroke="var(--border)" stroke-dasharray="3,3"/>`;
+    yLabels+='<text x="'+(PAD-6)+'" y="'+(y+4)+'" text-anchor="end" fill="var(--text-dim)" font-size="10">'+v.toFixed(2)+'</text>';
+    yLabels+='<line x1="'+PAD+'" x2="'+(W-PADR)+'" y1="'+y+'" y2="'+y+'" stroke="var(--border)" stroke-dasharray="3,3"/>';
   }
 
-  // X axis: show a few iteration labels
   let xLabels='';
   const step=Math.max(1,Math.floor(n/6));
   for(let i=0;i<n;i+=step){
-    xLabels+=`<text x="${sx(i)}" y="${H-PADB+16}" text-anchor="middle" fill="var(--text-dim)" font-size="10">#${pts[i].iter}</text>`;
+    xLabels+='<text x="'+sx(i)+'" y="'+(H-PADB+16)+'" text-anchor="middle" fill="var(--text-dim)" font-size="10">#'+pts[i].iter+'</text>';
   }
-  // always show last
   if(n>1){
-    xLabels+=`<text x="${sx(n-1)}" y="${H-PADB+16}" text-anchor="middle" fill="var(--text-dim)" font-size="10">#${pts[n-1].iter}</text>`;
+    xLabels+='<text x="'+sx(n-1)+'" y="'+(H-PADB+16)+'" text-anchor="middle" fill="var(--text-dim)" font-size="10">#'+pts[n-1].iter+'</text>';
   }
 
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    ${yLabels}${xLabels}
-    <path d="${areaPath}" fill="url(#areaGrad)" opacity=".25"/>
-    <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>
-    ${dots.join('')}
-    <defs><linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--accent)"/><stop offset="100%" stop-color="transparent"/></linearGradient></defs>
-  </svg>`;
+  return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'+
+    yLabels+xLabels+
+    '<path d="'+areaPath+'" fill="url(#areaGrad)" opacity=".25"/>'+
+    '<path d="'+path+'" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/>'+
+    dots.join('')+
+    '<defs><linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--accent)"/><stop offset="100%" stop-color="transparent"/></linearGradient></defs>'+
+  '</svg>';
 }
 
-// NEW: Equity Curve renderer
 function renderEquityCurve(data){
   const pts = data.equity_curve || [];
   if(!pts.length) return '<div style="color:var(--text-dim);text-align:center;padding:60px 0">No data</div>';
@@ -965,65 +1272,55 @@ function renderEquityCurve(data){
 
   const zeroY=sy(0);
 
-  // Build line path
   let linePath='M';
   pts.forEach((p,i)=>{
     const x=sx(i),y=sy(p.cumR);
     linePath+=(i?'L':'')+x.toFixed(1)+','+y.toFixed(1);
   });
 
-  // Build positive area (above zero)
-  let posArea='';
-  let negArea='';
-
-  // We'll create a single area path and use clip paths for pos/neg
   let areaPath='M'+sx(0).toFixed(1)+','+zeroY.toFixed(1);
   pts.forEach((p,i)=>{
     areaPath+=' L'+sx(i).toFixed(1)+','+sy(p.cumR).toFixed(1);
   });
   areaPath+=' L'+sx(n-1).toFixed(1)+','+zeroY.toFixed(1)+' Z';
 
-  // Y axis labels
   let yLabels='';
   for(let i=0;i<=4;i++){
     const v=mn+rng*(i/4);
     const y=sy(v);
-    yLabels+=`<text x="${PAD-6}" y="${y+4}" text-anchor="end" fill="var(--text-dim)" font-size="10">${v.toFixed(2)}R</text>`;
-    yLabels+=`<line x1="${PAD}" x2="${W-PADR}" y1="${y}" y2="${y}" stroke="var(--border)" stroke-dasharray="3,3"/>`;
+    yLabels+='<text x="'+(PAD-6)+'" y="'+(y+4)+'" text-anchor="end" fill="var(--text-dim)" font-size="10">'+v.toFixed(2)+'R</text>';
+    yLabels+='<line x1="'+PAD+'" x2="'+(W-PADR)+'" y1="'+y+'" y2="'+y+'" stroke="var(--border)" stroke-dasharray="3,3"/>';
   }
 
-  // Zero line
   let zeroLine='';
   if(mn<0 && mx>0){
-    zeroLine=`<line x1="${PAD}" x2="${W-PADR}" y1="${zeroY.toFixed(1)}" y2="${zeroY.toFixed(1)}" stroke="var(--text-dim)" stroke-width="1" stroke-dasharray="4,2" opacity=".6"/>`;
+    zeroLine='<line x1="'+PAD+'" x2="'+(W-PADR)+'" y1="'+zeroY.toFixed(1)+'" y2="'+zeroY.toFixed(1)+'" stroke="var(--text-dim)" stroke-width="1" stroke-dasharray="4,2" opacity=".6"/>';
   }
 
-  // X axis labels
   let xLabels='';
   const step=Math.max(1,Math.floor(n/6));
   for(let i=0;i<n;i+=step){
-    xLabels+=`<text x="${sx(i)}" y="${H-PADB+16}" text-anchor="middle" fill="var(--text-dim)" font-size="10">#${pts[i].iter}</text>`;
+    xLabels+='<text x="'+sx(i)+'" y="'+(H-PADB+16)+'" text-anchor="middle" fill="var(--text-dim)" font-size="10">#'+pts[i].iter+'</text>';
   }
   if(n>1){
-    xLabels+=`<text x="${sx(n-1)}" y="${H-PADB+16}" text-anchor="middle" fill="var(--text-dim)" font-size="10">#${pts[n-1].iter}</text>`;
+    xLabels+='<text x="'+sx(n-1)+'" y="'+(H-PADB+16)+'" text-anchor="middle" fill="var(--text-dim)" font-size="10">#'+pts[n-1].iter+'</text>';
   }
 
-  // Final R value label
   const lastR=pts[n-1].cumR;
   const rColor=lastR>=0?'var(--green)':'var(--red)';
-  const rLabel=`<text x="${W-PADR+2}" y="${sy(lastR)+4}" fill="${rColor}" font-size="11" font-weight="700">${lastR>=0?'+':''}${lastR.toFixed(2)}R</text>`;
+  const rLabel='<text x="'+(W-PADR+2)+'" y="'+(sy(lastR)+4)+'" fill="'+rColor+'" font-size="11" font-weight="700">'+(lastR>=0?'+':'')+lastR.toFixed(2)+'R</text>';
 
-  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
-    <defs>
-      <clipPath id="clipPos"><rect x="0" y="0" width="${W}" height="${zeroY.toFixed(1)}"/></clipPath>
-      <clipPath id="clipNeg"><rect x="0" y="${zeroY.toFixed(1)}" width="${W}" height="${H-zeroY}"/></clipPath>
-    </defs>
-    ${yLabels}${xLabels}${zeroLine}
-    <path d="${areaPath}" fill="var(--green)" opacity=".18" clip-path="url(#clipPos)"/>
-    <path d="${areaPath}" fill="var(--red)" opacity=".18" clip-path="url(#clipNeg)"/>
-    <path d="${linePath}" fill="none" stroke="${rColor}" stroke-width="2" stroke-linejoin="round"/>
-    ${rLabel}
-  </svg>`;
+  return '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'+
+    '<defs>'+
+      '<clipPath id="clipPos"><rect x="0" y="0" width="'+W+'" height="'+zeroY.toFixed(1)+'"/></clipPath>'+
+      '<clipPath id="clipNeg"><rect x="0" y="'+zeroY.toFixed(1)+'" width="'+W+'" height="'+(H-zeroY)+'"/></clipPath>'+
+    '</defs>'+
+    yLabels+xLabels+zeroLine+
+    '<path d="'+areaPath+'" fill="var(--green)" opacity=".18" clip-path="url(#clipPos)"/>'+
+    '<path d="'+areaPath+'" fill="var(--red)" opacity=".18" clip-path="url(#clipNeg)"/>'+
+    '<path d="'+linePath+'" fill="none" stroke="'+rColor+'" stroke-width="2" stroke-linejoin="round"/>'+
+    rLabel+
+  '</svg>';
 }
 
 function renderAgents(data){
@@ -1031,59 +1328,63 @@ function renderAgents(data){
   let h='';
   agents.forEach(a=>{
     const cls=a.alive?'on':'off';
-    const meta=a.alive?(a.cpu?`CPU ${a.cpu}% MEM ${a.mem}%`:'running'):'not running';
-    const extra=a.last_line?` &mdash; <span style="opacity:.65">${esc(a.last_line)}</span>`:'';
-    h+=`<div class="agent-row"><span class="agent-dot ${cls}"></span><span class="agent-label">${esc(a.label)}</span><span class="agent-meta">${meta}${extra}</span></div>`;
+    const meta=a.alive?(a.cpu?'CPU '+a.cpu+'% MEM '+a.mem+'%':'running'):'not running';
+    const extra=a.last_line?' &mdash; <span style="opacity:.65">'+esc(a.last_line)+'</span>':'';
+    h+='<div class="agent-row"><span class="agent-dot '+cls+'"></span><span class="agent-label">'+esc(a.label)+'</span><span class="agent-meta">'+meta+extra+'</span></div>';
   });
   const w=data.workers||{};
   if(w.count>0){
-    h+=`<div class="agent-row"><span class="agent-dot on"></span><span class="agent-label">Workers</span><span class="agent-meta">${w.count} processes, CPU ${w.total_cpu.toFixed(0)}%</span></div>`;
+    h+='<div class="agent-row"><span class="agent-dot on"></span><span class="agent-label">Workers</span><span class="agent-meta">'+w.count+' processes, CPU '+w.total_cpu.toFixed(0)+'%</span></div>';
   }
   return h;
 }
 
-// NEW: ImpulseAgent Progress renderer
 function renderImpulse(data){
   const imp=data.impulse_progress||{};
   if(imp.status==='no_data'){
-    return `<div style="display:flex;align-items:center;gap:12px;padding:20px 0">
-      <div style="font-size:1.8rem">&#x1F50D;</div>
-      <div>
-        <div style="color:var(--text-bright);font-weight:600;margin-bottom:4px">ImpulseAgent: \u0441\u043a\u0430\u043d\u0438\u0440\u0443\u0435\u0442...</div>
-        <div style="color:var(--text-dim);font-size:.82rem">\u041e\u0436\u0438\u0434\u0430\u043d\u0438\u0435 \u0434\u0430\u043d\u043d\u044b\u0445 \u0430\u043d\u0430\u043b\u0438\u0437\u0430</div>
-      </div>
-    </div>`;
+    return '<div style="display:flex;align-items:center;gap:12px;padding:20px 0">'+
+      '<div style="font-size:1.8rem">&#x1F50D;</div>'+
+      '<div>'+
+        '<div style="color:var(--text-bright);font-weight:600;margin-bottom:4px">ImpulseAgent: \u0441\u043a\u0430\u043d\u0438\u0440\u0443\u0435\u0442...</div>'+
+        '<div style="color:var(--text-dim);font-size:.82rem">\u041e\u0436\u0438\u0434\u0430\u043d\u0438\u0435 \u0434\u0430\u043d\u043d\u044b\u0445 \u0430\u043d\u0430\u043b\u0438\u0437\u0430</div>'+
+      '</div>'+
+    '</div>';
   }
   const coins=imp.coins_analyzed||0;
   const patterns=imp.patterns_found||0;
   const alert=imp.last_alert||'\u043d\u0435\u0442';
-  return `<div style="padding:10px 0">
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px">
-      <div style="text-align:center">
-        <div style="font-size:1.6rem;font-weight:700;color:var(--accent)">${coins}</div>
-        <div style="font-size:.75rem;color:var(--text-dim);text-transform:uppercase">\u041c\u043e\u043d\u0435\u0442</div>
-      </div>
-      <div style="text-align:center">
-        <div style="font-size:1.6rem;font-weight:700;color:${patterns>0?'var(--green)':'var(--text-dim)'}">${patterns}</div>
-        <div style="font-size:.75rem;color:var(--text-dim);text-transform:uppercase">\u041f\u0430\u0442\u0442\u0435\u0440\u043d\u043e\u0432</div>
-      </div>
-      <div style="text-align:center">
-        <div style="font-size:.9rem;font-weight:600;color:var(--text-bright);margin-top:6px">${esc(alert)}</div>
-        <div style="font-size:.75rem;color:var(--text-dim);text-transform:uppercase">\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0430\u043b\u0435\u0440\u0442</div>
-      </div>
-    </div>
-    <div style="font-size:.8rem;color:var(--text-dim)">\u041f\u0440\u043e\u0430\u043d\u0430\u043b\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u043d\u043e: ${coins} \u043c\u043e\u043d\u0435\u0442 | \u041f\u0430\u0442\u0442\u0435\u0440\u043d\u043e\u0432: ${patterns} | \u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0430\u043b\u0435\u0440\u0442: ${esc(alert)}</div>
-  </div>`;
+  return '<div style="padding:10px 0">'+
+    '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px">'+
+      '<div style="text-align:center">'+
+        '<div style="font-size:1.6rem;font-weight:700;color:var(--accent)">'+coins+'</div>'+
+        '<div style="font-size:.75rem;color:var(--text-dim);text-transform:uppercase">\u041c\u043e\u043d\u0435\u0442</div>'+
+      '</div>'+
+      '<div style="text-align:center">'+
+        '<div style="font-size:1.6rem;font-weight:700;color:'+(patterns>0?'var(--green)':'var(--text-dim)')+'">'+patterns+'</div>'+
+        '<div style="font-size:.75rem;color:var(--text-dim);text-transform:uppercase">\u041f\u0430\u0442\u0442\u0435\u0440\u043d\u043e\u0432</div>'+
+      '</div>'+
+      '<div style="text-align:center">'+
+        '<div style="font-size:.9rem;font-weight:600;color:var(--text-bright);margin-top:6px">'+esc(alert)+'</div>'+
+        '<div style="font-size:.75rem;color:var(--text-dim);text-transform:uppercase">\u041f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 \u0430\u043b\u0435\u0440\u0442</div>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
 }
 
 function renderInstruments(data){
   const list=data.instruments||[];
   if(!list.length) return '<div style="color:var(--text-dim)">No data</div>';
-  let h='<table class="tbl"><thead><tr><th>Instrument</th><th>WR</th><th style="min-width:90px"></th><th>R</th><th>Trades</th></tr></thead><tbody>';
+  let h='<table class="tbl"><thead><tr><th>Instrument</th><th>WR</th><th style="min-width:90px"></th><th>R</th><th>Score</th><th>Trades</th></tr></thead><tbody>';
   list.forEach(i=>{
     const w=i.winrate;
     const rc=i.total_r>=0?'color:var(--green)':'color:var(--red)';
-    h+=`<tr><td style="font-weight:600">${esc(i.name)}</td><td>${pct(w)}</td><td><div class="wr-bar-bg"><div class="wr-bar-fill ${wrClass(w)}" style="width:${(w*100).toFixed(0)}%"></div></div></td><td style="${rc};font-weight:600">${i.total_r>=0?'+':''}${i.total_r.toFixed(0)}R</td><td style="color:var(--text-dim)">${i.trades}</td></tr>`;
+    let scoreHtml='<span style="color:var(--text-dim)">--</span>';
+    if(i.score!=null && i.score!==-999){
+      const sc=i.score;
+      const scColor=sc>0?'var(--green)':sc<0?'var(--red)':'var(--text-dim)';
+      scoreHtml='<span style="color:'+scColor+';font-weight:600">'+(sc>0?'+':'')+sc.toFixed(2)+'</span>';
+    }
+    h+='<tr><td style="font-weight:600">'+esc(i.name)+'</td><td>'+pct(w)+'</td><td><div class="wr-bar-bg"><div class="wr-bar-fill '+wrClass(w)+'" style="width:'+(w*100).toFixed(0)+'%"></div></div></td><td style="'+rc+';font-weight:600">'+(i.total_r>=0?'+':'')+i.total_r.toFixed(0)+'R</td><td>'+scoreHtml+'</td><td style="color:var(--text-dim)">'+i.trades+'</td></tr>';
   });
   h+='</tbody></table>';
   return h;
@@ -1095,7 +1396,7 @@ function renderSessions(data){
   let h='<table class="tbl"><thead><tr><th>Session</th><th>WR</th><th></th><th>Trades</th></tr></thead><tbody>';
   list.forEach(s=>{
     const w=s.winrate;
-    h+=`<tr><td style="font-weight:600">${esc(s.name)}</td><td>${pct(w)}</td><td><div class="wr-bar-bg"><div class="wr-bar-fill ${wrClass(w)}" style="width:${(w*100).toFixed(0)}%"></div></div></td><td style="color:var(--text-dim)">${s.trades}</td></tr>`;
+    h+='<tr><td style="font-weight:600">'+esc(s.name)+'</td><td>'+pct(w)+'</td><td><div class="wr-bar-bg"><div class="wr-bar-fill '+wrClass(w)+'" style="width:'+(w*100).toFixed(0)+'%"></div></div></td><td style="color:var(--text-dim)">'+s.trades+'</td></tr>';
   });
   h+='</tbody></table>';
   return h;
@@ -1108,17 +1409,28 @@ function renderExits(data){
   let barH='<div class="exit-bar-wrap">';
   list.forEach(e=>{
     const w=(e.count/total*100).toFixed(1);
-    barH+=`<div class="exit-seg ${e.reason}" style="width:${w}%">${w>6?e.reason.toUpperCase()+' '+e.count:e.count}</div>`;
+    barH+='<div class="exit-seg '+e.reason+'" style="width:'+w+'%">'+(w>6?e.reason.toUpperCase()+' '+e.count:e.count)+'</div>';
   });
   barH+='</div>';
   const labels={'tp':'Take Profit','sl':'Stop Loss','be':'Break Even','time_exit':'Time Exit'};
   barH+='<div class="exit-legend">';
   list.forEach(e=>{
     const cls='l-'+(e.reason==='time_exit'?'time':e.reason);
-    barH+=`<span class="${cls}">${labels[e.reason]||e.reason}: ${e.count} (${e.pct.toFixed(1)}%)</span>`;
+    barH+='<span class="'+cls+'">'+(labels[e.reason]||e.reason)+': '+e.count+' ('+e.pct.toFixed(1)+'%)</span>';
   });
   barH+='</div>';
   return barH;
+}
+
+function renderMfeMae(data){
+  const m=data.mfe_mae;
+  if(!m||!m.has_data) return '';
+  return '<div style="font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text-dim);margin-bottom:8px">Avg PnL by Exit Type</div>'+
+    '<div class="mfe-grid">'+
+      '<div class="mfe-item"><div class="mfe-val" style="color:var(--green)">+'+m.tp_avg_pnl.toFixed(2)+'R</div><div class="mfe-label">TP Avg</div><div class="mfe-sub">'+m.tp_count+' trades</div></div>'+
+      '<div class="mfe-item"><div class="mfe-val" style="color:var(--yellow)">'+m.be_avg_pnl.toFixed(2)+'R</div><div class="mfe-label">BE Avg</div><div class="mfe-sub">'+m.be_count+' trades</div></div>'+
+      '<div class="mfe-item"><div class="mfe-val" style="color:var(--red)">'+m.sl_avg_pnl.toFixed(2)+'R</div><div class="mfe-label">SL Avg</div><div class="mfe-sub">'+m.sl_count+' trades</div></div>'+
+    '</div>';
 }
 
 function renderExperiments(data){
@@ -1129,15 +1441,15 @@ function renderExperiments(data){
     const act=e.action||'?';
     const bcls=act==='keep'?'keep':act==='revert'?'revert':act==='error'?'error':'baseline';
     const chg=(e.old_value!=null&&e.new_value!=null)?esc(e.old_value)+' &rarr; '+esc(e.new_value):'&mdash;';
-    h+=`<tr>
-      <td style="font-weight:600;color:var(--text-dim)">${e.iteration}</td>
-      <td style="color:var(--accent)">${esc(e.param_changed||'baseline')}</td>
-      <td style="font-size:.82rem">${chg}</td>
-      <td style="font-weight:600">${(e.avg_score||0).toFixed(4)}</td>
-      <td>${pct(e.avg_winrate||0)}</td>
-      <td style="color:var(--text-dim)">${e.total_trades||0}</td>
-      <td><span class="badge ${bcls}">${act}</span></td>
-    </tr>`;
+    h+='<tr>'+
+      '<td style="font-weight:600;color:var(--text-dim)">'+e.iteration+'</td>'+
+      '<td style="color:var(--accent)">'+esc(e.param_changed||'baseline')+'</td>'+
+      '<td style="font-size:.82rem">'+chg+'</td>'+
+      '<td style="font-weight:600">'+(e.avg_score||0).toFixed(4)+'</td>'+
+      '<td>'+pct(e.avg_winrate||0)+'</td>'+
+      '<td style="color:var(--text-dim)">'+(e.total_trades||0)+'</td>'+
+      '<td><span class="badge '+bcls+'">'+act+'</span></td>'+
+    '</tr>';
   });
   h+='</tbody></table>';
   return h;
@@ -1148,15 +1460,14 @@ function renderParams(data){
   const keys=Object.keys(p);
   if(!keys.length) return '<div style="color:var(--text-dim)">No params</div>';
   let h='';
-  // group: top-level, crypto_overrides, forex_overrides
   const groups=[{title:'Global',obj:p,skip:['crypto_overrides','forex_overrides']},{title:'Crypto Overrides',obj:p.crypto_overrides||{}},{title:'Forex Overrides',obj:p.forex_overrides||{}}];
   groups.forEach(g=>{
     const entries=Object.entries(g.obj).filter(([k])=>!(g.skip||[]).includes(k)&&typeof g.obj[k]!=='object');
     if(!entries.length) return;
-    h+=`<div style="font-size:.75rem;text-transform:uppercase;color:var(--text-dim);margin:10px 0 6px;letter-spacing:.04em">${g.title}</div>`;
+    h+='<div style="font-size:.75rem;text-transform:uppercase;color:var(--text-dim);margin:10px 0 6px;letter-spacing:.04em">'+g.title+'</div>';
     h+='<div class="params-grid">';
     entries.forEach(([k,v])=>{
-      h+=`<div class="param-item"><span class="pk">${esc(k)}</span><span class="pv">${esc(String(v))}</span></div>`;
+      h+='<div class="param-item"><span class="pk">'+esc(k)+'</span><span class="pv">'+esc(String(v))+'</span></div>';
     });
     h+='</div>';
   });
@@ -1173,7 +1484,7 @@ function renderLog(data){
     if(ll.includes('error')||ll.includes('fail')) cls='err';
     else if(l.includes('KEEP')) cls='keep';
     else if(l.includes('REVERT')) cls='rev';
-    h+=`<div class="log-line ${cls}" title="${esc(l)}">${esc(l)}</div>`;
+    h+='<div class="log-line '+cls+'" title="'+esc(l)+'">'+esc(l)+'</div>';
   });
   return h;
 }
@@ -1192,6 +1503,17 @@ function update(data){
   $('hdr-time').textContent=data.timestamp||'--';
   $('hdr-iter').textContent=(data.stats.total_experiments||0)+' experiments';
 
+  // day/night mode
+  const dn=data.day_night||{};
+  const modeBadge=$('mode-badge');
+  if(dn.is_night){
+    modeBadge.className='mode-badge night';
+    modeBadge.innerHTML='\uD83C\uDF19 '+esc(dn.label||'Night')+' <span style="font-weight:400;opacity:.7">'+esc(dn.kyiv_time||'')+'</span>';
+  } else {
+    modeBadge.className='mode-badge day';
+    modeBadge.innerHTML='\u2600\uFE0F '+esc(dn.label||'Day')+' <span style="font-weight:400;opacity:.7">'+esc(dn.kyiv_time||'')+'</span>';
+  }
+
   // stat cards
   const s=data.stats;
   $('sc-score').textContent=s.score.toFixed(2);
@@ -1203,11 +1525,28 @@ function update(data){
   $('sc-exp-sub').innerHTML='<span style="color:var(--green)">'+s.kept+' kept</span> &middot; <span style="color:var(--red)">'+s.reverted+' rev</span>'+(s.errors?' &middot; <span style="color:var(--yellow)">'+s.errors+' err</span>':'');
   $('sc-best').textContent=s.best_instrument;
 
-  // NEW: consecutive reverts
+  // last change detail
+  const lc=data.last_change;
+  const lcCard=$('last-change-card');
+  if(lc){
+    lcCard.style.display='block';
+    const act=lc.action||'?';
+    const bcls=act==='keep'?'keep':act==='revert'?'revert':act==='error'?'error':'baseline';
+    $('lc-badge').className='badge '+bcls;
+    $('lc-badge').textContent=act;
+    $('lc-param').textContent=lc.param||'--';
+    const chg=(lc.old_value!=null&&lc.new_value!=null)?esc(lc.old_value)+' \u2192 '+esc(lc.new_value):'';
+    $('lc-change').innerHTML=chg;
+    $('lc-score').textContent='score: '+(lc.score||0).toFixed(4);
+    $('lc-notes').textContent=lc.notes||'';
+  } else {
+    lcCard.style.display='none';
+  }
+
+  // consecutive reverts
   const cr=data.consecutive_reverts||0;
   const crColor=cr<=3?'var(--green)':cr<=6?'var(--yellow)':'var(--red)';
-  const crEmoji=cr<=3?'':cr<=6?' \u26A0\uFE0F':' \uD83D\uDD34';
-  $('reverts-value').textContent=cr+' \u0440\u0435\u0432\u0435\u0440\u0442\u043e\u0432 \u043f\u043e\u0434\u0440\u044f\u0434'+crEmoji;
+  $('reverts-value').textContent=cr+' \u0440\u0435\u0432\u0435\u0440\u0442\u043e\u0432 \u043f\u043e\u0434\u0440\u044f\u0434';
   $('reverts-value').style.color=crColor;
   $('reverts-icon').style.color=crColor;
   if(cr>=7){
@@ -1224,7 +1563,7 @@ function update(data){
     $('reverts-card').style.borderColor='var(--border)';
   }
 
-  // NEW: next iteration countdown
+  // next iteration countdown
   const ni=data.next_iteration||{};
   nextIterCountdown=ni.seconds_until;
   updateCountdownDisplay();
@@ -1232,7 +1571,29 @@ function update(data){
     $('next-iter-sub').textContent='\u0421\u0440\u0435\u0434\u043d\u044f\u044f \u0438\u0442\u0435\u0440\u0430\u0446\u0438\u044f: '+Math.round(ni.avg_duration/60)+' \u043c\u0438\u043d';
   }
 
-  // NEW: holdout status
+  // iteration speed & ETA
+  const spd=data.iteration_speed||{};
+  $('speed-value').textContent=(spd.iters_per_hour||0).toFixed(1)+'/\u0447';
+  let speedSub=spd.total+'/'+spd.target+' \u0438\u0442\u0435\u0440\u0430\u0446\u0438\u0439';
+  if(spd.eta_hours!=null){
+    if(spd.eta_hours<1){
+      speedSub+=' \u2022 ETA: '+Math.round(spd.eta_hours*60)+' \u043c\u0438\u043d';
+    } else {
+      speedSub+=' \u2022 ETA: '+spd.eta_hours.toFixed(1)+' \u0447';
+    }
+  }
+  $('speed-sub').textContent=speedSub;
+
+  // keep/revert ratio
+  const kr=data.keep_revert_ratio||{};
+  const kr10=kr.last10_keep_pct||0;
+  const kr50=kr.last50_keep_pct||0;
+  $('keep-ratio-value').textContent=kr10.toFixed(0)+'% / '+kr50.toFixed(0)+'%';
+  const krColor=kr10>20?'var(--green)':kr10>=10?'var(--yellow)':'var(--red)';
+  $('keep-ratio-value').style.color=krColor;
+  $('keep-ratio-sub').textContent='last 10 / last 50';
+
+  // holdout status
   const ho=data.holdout||{};
   if(ho.status==='completed'&&ho.results){
     const r=ho.results;
@@ -1254,19 +1615,20 @@ function update(data){
   // score chart
   $('chart-area').innerHTML=renderChart(data);
 
-  // NEW: equity curve chart
+  // equity curve chart
   $('equity-chart-area').innerHTML=renderEquityCurve(data);
 
   // agents
   $('agents-area').innerHTML=renderAgents(data);
 
-  // NEW: impulse progress
+  // impulse progress
   $('impulse-area').innerHTML=renderImpulse(data);
 
   // instruments, sessions, exits
   $('instruments-area').innerHTML=renderInstruments(data);
   $('sessions-area').innerHTML=renderSessions(data);
   $('exits-area').innerHTML=renderExits(data);
+  $('mfe-area').innerHTML=renderMfeMae(data);
 
   // experiments
   $('exp-area').innerHTML=renderExperiments(data);
@@ -1306,9 +1668,9 @@ function fetchData(){
     .catch(e=>console.warn('fetch error',e));
 }
 
-// initial + interval
+// initial + interval (30s matches cache TTL)
 fetchData();
-setInterval(fetchData,10000);
+setInterval(fetchData,30000);
 
 })();
 </script>
@@ -1318,8 +1680,29 @@ setInterval(fetchData,10000);
 
 # --------------- HTTP handler ---------------
 
+AUTH_USER = "111blackjack111"
+AUTH_PASS = "qwertrewq123454321"
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
+    def _check_auth(self):
+        auth = self.headers.get("Authorization")
+        if auth and auth.startswith("Basic "):
+            decoded = base64.b64decode(auth[6:]).decode()
+            if decoded == f"{AUTH_USER}:{AUTH_PASS}":
+                return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Trading Dashboard"')
+        self.end_headers()
+        return False
+
     def do_GET(self):
+        if not self._check_auth():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/api/data":
             qs = parse_qs(parsed.query)
@@ -1344,6 +1727,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = 8080
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    print(f"[Dashboard v4] Running on http://0.0.0.0:{port}")
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"[Dashboard v5] Running on http://0.0.0.0:{port}")
     server.serve_forever()

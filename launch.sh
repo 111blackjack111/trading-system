@@ -32,6 +32,8 @@ sleep 2
 echo "Starting Orchestrator v2..."
 tmux new-session -d -s orchestrator "
 cd $DIR && source $VENV
+export TELEGRAM_BOT_TOKEN=8588577391:AAE5poxdFXYDFVlf8fkCe3kZXOGCHRqVFfI
+export TELEGRAM_CHAT_ID=438218324
 python3 agents/orchestrator_v2.py --iterations $ITERATIONS --skip-data 2>&1 | tee results/orchestrator.log
 "
 

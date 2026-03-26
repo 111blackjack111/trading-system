@@ -1,32 +1,41 @@
 {
-  "fvg_min_size_multiplier": 0.3,
-  "fvg_entry_depth": 0.5,
-  "ob_lookback": 15,
-  "bos_swing_length": 14,
+  "fvg_min_size_multiplier": 0.35,
+  "fvg_entry_depth": 0.25,
+  "ob_lookback": 12,
+  "bos_swing_length": 8,
   "sl_atr_multiplier": 1.5,
   "be_trigger_rr": 1.0,
   "tp_rr_ratio": 2.0,
   "session_filter": true,
   "silver_bullet_only": false,
   "volatility_filter": true,
-  "min_atr_percentile": 40,
-  "fvg_max_age_bars": 14,
-  "confirmation_candle_pct": 0.6,
+  "min_atr_percentile": 42,
+  "fvg_max_age_bars": 7,
+  "confirmation_candle_pct": 0.5,
   "ob_confluence": true,
   "sweep_filter": false,
   "choch_filter": false,
   "news_filter": true,
   "crypto_hours_filter": true,
   "crypto_overrides": {
-    "be_trigger_rr": 1.0,
-    "sl_atr_multiplier": 2.0,
-    "tp_rr_ratio": 2.0,
-    "min_atr_percentile": 50
+    "be_trigger_rr": 0.45,
+    "sl_atr_multiplier": 2.75,
+    "tp_rr_ratio": 1.75,
+    "min_atr_percentile": 44.0
   },
   "forex_overrides": {
-    "be_trigger_rr": 1.0,
-    "sl_atr_multiplier": 1.5,
-    "tp_rr_ratio": 2.0,
-    "min_atr_percentile": 45
-  }
+    "be_trigger_rr": 0.9,
+    "sl_atr_multiplier": 1.8,
+    "tp_rr_ratio": 1.55,
+    "min_atr_percentile": 35
+  },
+  "partial_tp_enabled": false,
+  "partial_tp_rr": 1.0,
+  "partial_tp_pct": 0.5,
+  "trailing_stop_enabled": true,
+  "trailing_stop_activation_rr": 1.2,
+  "trailing_stop_distance_rr": 0.2,
+  "news_minutes_before": 30,
+  "news_minutes_after": 30,
+  "monday_filter": false
 }

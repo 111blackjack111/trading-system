@@ -30,11 +30,12 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
-TIMEOUT_BACKTEST = 3600  # 60 минут макс (5 лет × 12 инструментов = тяжёлый бэктест)
+TIMEOUT_BACKTEST_DAY = 1800   # 30 min for 1-2 core instruments (GBP_USD only during day)
+TIMEOUT_BACKTEST_NIGHT = 3600  # 60 min for 7 instruments during night
 
 
 def is_night_mode():
-    """Ночной режим: 00:00-08:00 Kyiv (UTC+3). Opus + все инструменты + автономия."""
+    """Ночной режим: 00:00-08:00 Kyiv (UTC+2). Opus + все инструменты + автономия."""
     kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
     if kyiv_hour >= 24:
         kyiv_hour -= 24
@@ -68,29 +69,66 @@ def send_telegram(message):
 # ============================================================
 
 class ParamBlacklist:
-    def __init__(self):
+    """Blacklist с persistence в SQLite — выживает рестарты."""
+
+    def __init__(self, db_path=None):
+        self.db_path = db_path or DB_PATH
         self.revert_counts = {}  # param -> count
         self.cooldown = {}       # param -> iteration when unblocked
+        self._init_table()
+        self._load()
+
+    def _init_table(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS param_blacklist (
+                param TEXT PRIMARY KEY,
+                revert_count INTEGER DEFAULT 0,
+                cooldown_until INTEGER DEFAULT 0
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _load(self):
+        conn = sqlite3.connect(self.db_path)
+        for row in conn.execute("SELECT param, revert_count, cooldown_until FROM param_blacklist"):
+            self.revert_counts[row[0]] = row[1]
+            if row[2] > 0:
+                self.cooldown[row[0]] = row[2]
+        conn.close()
+        if self.cooldown:
+            print(f"  [Blacklist] Loaded {len(self.cooldown)} blocked params from DB")
+
+    def _save(self, param):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("""
+            INSERT OR REPLACE INTO param_blacklist (param, revert_count, cooldown_until)
+            VALUES (?, ?, ?)
+        """, (param, self.revert_counts.get(param, 0), self.cooldown.get(param, 0)))
+        conn.commit()
+        conn.close()
 
     def record_revert(self, param, current_iter):
         self.revert_counts[param] = self.revert_counts.get(param, 0) + 1
         if self.revert_counts[param] >= 2:
             self.cooldown[param] = current_iter + 20
             print(f"  [Blacklist] {param} blocked for 20 iterations (reverts: {self.revert_counts[param]})")
+        self._save(param)
 
     def record_keep(self, param):
-        # Reset on success
         self.revert_counts[param] = 0
         if param in self.cooldown:
             del self.cooldown[param]
+        self._save(param)
 
     def is_blocked(self, param, current_iter):
         if param in self.cooldown and current_iter < self.cooldown[param]:
             return True
         elif param in self.cooldown and current_iter >= self.cooldown[param]:
-            # Cooldown expired — reset
             del self.cooldown[param]
             self.revert_counts[param] = 0
+            self._save(param)
         return False
 
 
@@ -112,14 +150,15 @@ def expand_param_ranges(factor=1.2):
 # Conflict detector — WR↑ но score↓ в 10x → аномалия
 # ============================================================
 
-def is_anomaly(new_score, best_score, new_wr, baseline_wr):
-    """WR выше но score упал в 10+ раз — аномалия."""
-    if best_score <= 0:
-        return False
-    if new_wr > baseline_wr and new_score < 0:
-        score_drop = abs(new_score) / max(abs(best_score), 0.01)
-        if score_drop > 10:
-            return True
+def is_anomaly(new_score, best_score, total_trades):
+    """Определяет аномальные результаты бэктеста.
+    - score < -100: явно сломано (< 10 trades = -999)
+    - score < -10 и < 30 trades: недостаточно данных для надёжного результата
+    """
+    if new_score < -100:
+        return True
+    if new_score < -10 and total_trades < 30:
+        return True
     return False
 
 
@@ -203,20 +242,36 @@ def init_db():
     conn.close()
 
 
+def is_duplicate_experiment(param, new_value, tolerance=0.01):
+    """Проверяет, был ли уже такой (param, value) в экспериментах."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.execute(
+        "SELECT COUNT(*) FROM experiments WHERE param_changed = ? AND ABS(new_value - ?) < ?",
+        (param, new_value, tolerance)
+    )
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
+
+
 def request_backtest(params, request_id, changed_param=""):
     os.makedirs(RUNTIME_DIR, exist_ok=True)
     if os.path.exists(DONE_FILE):
         os.remove(DONE_FILE)
     request = {"id": request_id, "params": params, "timestamp": time.time(), "changed_param": changed_param}
-    with open(REQUEST_FILE, "w") as f:
+    # Atomic write: temp file + rename to prevent partial reads
+    tmp_req = REQUEST_FILE + ".tmp"
+    with open(tmp_req, "w") as f:
         json.dump(request, f, indent=2)
+    os.rename(tmp_req, REQUEST_FILE)
     group = "crypto" if changed_param.startswith("crypto_overrides.") else ("forex" if changed_param.startswith("forex_overrides.") else "all")
     print(f"  [Orchestrator] Backtest request #{request_id} sent (group: {group})")
 
 
 def wait_for_backtest(request_id):
+    timeout = TIMEOUT_BACKTEST_NIGHT if is_night_mode() else TIMEOUT_BACKTEST_DAY
     start = time.time()
-    while time.time() - start < TIMEOUT_BACKTEST:
+    while time.time() - start < timeout:
         if os.path.exists(DONE_FILE):
             with open(DONE_FILE) as f:
                 result = json.load(f)
@@ -282,7 +337,7 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
 # Night report — отправляется утром при переходе ночь→день
 # ============================================================
 
-CORE_INSTRUMENTS = {"USD_JPY", "BTCUSDT", "EUR_GBP", "GBP_USD"}
+CORE_INSTRUMENTS = {"GBP_USD"}
 
 
 def send_night_report(night_results):
@@ -350,12 +405,6 @@ def run(max_iterations=100, skip_data_download=False):
     baseline_result = wait_for_backtest("baseline")
     baseline_score = baseline_result.get("avg_score", 0)
 
-    # Get baseline WR for conflict detection
-    baseline_wr = 0
-    for m in baseline_result.get("results", {}).values():
-        if m and m.get("winrate"):
-            baseline_wr = max(baseline_wr, m.get("winrate", 0))
-
     save_experiment(0, {"param": "baseline", "reasoning": "Initial baseline"}, baseline_result, "baseline", params)
     print(f"\n  Baseline avg_score: {baseline_score:.4f}")
 
@@ -406,6 +455,13 @@ def run(max_iterations=100, skip_data_download=False):
             save_experiment(i, suggestion, {"avg_score": 0, "results": {}}, "blacklisted", params_backup)
             continue
 
+        # === DEDUP CHECK ===
+        if suggestion.get("type", "param_change") == "param_change":
+            if is_duplicate_experiment(param_name, suggestion.get("new_value", 0)):
+                print(f"  [Dedup] {param_name}={suggestion['new_value']} already tried — skipping")
+                save_experiment(i, suggestion, {"avg_score": 0, "results": {}}, "duplicate", params_backup)
+                continue
+
         # Применяем
         change_type = suggestion.get("type", "param_change")
         strategy_backup = None
@@ -447,11 +503,6 @@ def run(max_iterations=100, skip_data_download=False):
         total_trades_new = sum(
             m.get("total_trades", 0) for m in bt_result.get("results", {}).values() if m
         )
-        new_wr = max(
-            (m.get("winrate", 0) for m in bt_result.get("results", {}).values() if m),
-            default=0,
-        )
-
         # Трекинг ночных результатов по инструментам
         if is_night_mode():
             for inst, res in bt_result.get("results", {}).items():
@@ -465,23 +516,33 @@ def run(max_iterations=100, skip_data_download=False):
                         "profit_factor": m.get("profit_factor", 0),
                     }
 
-        # === CONFLICT DETECTOR ===
-        if is_anomaly(new_score, best_score, new_wr, baseline_wr):
-            print(f"\n  ANOMALY: WR↑ but score dropped {abs(new_score/max(abs(best_score),0.01)):.0f}x — skipping")
+        # === ANOMALY DETECTOR ===
+        if is_anomaly(new_score, best_score, total_trades_new):
+            print(f"\n  ANOMALY: score={new_score:.4f}, trades={total_trades_new} — skipping")
             save_params(params_backup)
             save_experiment(i, suggestion, bt_result, "anomaly", new_params)
             blacklist.record_revert(param_name, i)
             continue
 
+        # === EXPLORATION MODE ===
+        # Первые 30 итераций: принимаем результаты в пределах 95% от лучшего
+        # После 30: строгий monotonic improvement
+        explore_tolerance = 0.95 if i <= 30 else 1.0
+        score_threshold = best_score * explore_tolerance if best_score > 0 else best_score
+
         # Keep / Revert
-        if new_score > best_score and total_trades_new >= 30 and new_score != 0:
+        if new_score >= score_threshold and total_trades_new >= 30 and new_score != 0:
             action = "keep"
             improvement = new_score - best_score
-            best_score = new_score
+            if new_score > best_score:
+                best_score = new_score
             no_improvement_count = 0
             consecutive_reverts = 0
             blacklist.record_keep(param_name)
-            print(f"\n  KEEP: score {new_score:.4f} (+{improvement:.4f})")
+            if improvement > 0:
+                print(f"\n  KEEP: score {new_score:.4f} (+{improvement:.4f})")
+            else:
+                print(f"\n  KEEP (explore): score {new_score:.4f} (best: {best_score:.4f}, within {explore_tolerance:.0%})")
         else:
             action = "revert"
             if change_type == "code_change" and strategy_backup:
@@ -491,7 +552,7 @@ def run(max_iterations=100, skip_data_download=False):
                 print(f"\n  REVERT CODE: score {new_score:.4f} (best: {best_score:.4f})")
             else:
                 save_params(params_backup)
-                print(f"\n  REVERT: score {new_score:.4f} (best: {best_score:.4f})")
+                print(f"\n  REVERT: score {new_score:.4f} (threshold: {score_threshold:.4f})")
             no_improvement_count += 1
             consecutive_reverts += 1
             blacklist.record_revert(param_name, i)
