@@ -21,13 +21,11 @@ import sys
 import json
 import time
 import copy
-import importlib
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from strategy.base_strategy import load_params, save_params
-from backtest.runner import run_all, calculate_metrics
 from agents.orchestrator_v2 import init_db, send_telegram, ParamBlacklist
 from agents.optimizer_agent import suggest_change
 
@@ -70,27 +68,30 @@ TESTS = {
 ITERATIONS_PER_TEST = 20
 
 
+def _run_single(args):
+    """Worker function for parallel backtest."""
+    inst, params = args
+    from backtest.runner import run_backtest
+    return inst, run_backtest(inst, params)
+
+
 def run_backtest_direct(params):
-    """Запускает бэктест напрямую на всех инструментах, возвращает результат."""
+    """Запускает бэктест напрямую на всех инструментах (параллельно)."""
     save_params(params)
 
-    # Reload strategy module to pick up param changes
-    import strategy.base_strategy as bs
-    importlib.reload(bs)
-    # Also reload runner since it imports from base_strategy at module level
-    import backtest.runner as runner_mod
-    importlib.reload(runner_mod)
+    from multiprocessing import get_context
+    ctx = get_context("spawn")
+    args_list = [(inst, params) for inst in ALL_INSTRUMENTS]
 
-    raw = runner_mod.run_all(params=params, instruments_override=ALL_INSTRUMENTS)
-
-    # run_all returns {instrument: {"metrics": {...}, "trades": [...]}}
     results = {}
     scores = []
-    for inst, data in (raw or {}).items():
-        metrics = data.get("metrics") if isinstance(data, dict) else None
-        if metrics and metrics.get("score") is not None:
-            results[inst] = metrics
-            scores.append(metrics["score"])
+
+    with ctx.Pool(processes=2) as pool:
+        for inst, data in pool.map(_run_single, args_list):
+            metrics = data.get("metrics") if isinstance(data, dict) else None
+            if metrics and metrics.get("score") is not None:
+                results[inst] = metrics
+                scores.append(metrics["score"])
 
     avg_score = sum(scores) / len(scores) if scores else 0
 
