@@ -12,7 +12,7 @@
   "min_atr_percentile": 42,
   "fvg_max_age_bars": 7,
   "confirmation_candle_pct": 0.5,
-  "ob_confluence": false,
+  "ob_confluence": true,
   "sweep_filter": false,
   "choch_filter": false,
   "news_filter": true,
@@ -37,5 +37,6 @@
   "trailing_stop_distance_rr": 0.2,
   "news_minutes_before": 30,
   "news_minutes_after": 30,
+  "ny_session": false,
   "monday_filter": false
 }

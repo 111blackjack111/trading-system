@@ -281,10 +281,12 @@ def session_filter(timestamp, params):
 
     # London: 09:00-14:00 UTC+3 = 06:00-11:00 UTC
     # NY:     15:00-17:00 UTC+3 = 12:00-14:00 UTC
+    ny_enabled = params.get("ny_session", False)
     main_windows = [
         (dtime(6, 0), dtime(11, 0)),
-        (dtime(12, 0), dtime(14, 0)),
     ]
+    if ny_enabled:
+        main_windows.append((dtime(12, 0), dtime(14, 0)))
 
     if params.get("silver_bullet_only", False):
         # Silver Bullet окна (UTC):
