@@ -156,7 +156,8 @@ def run_test(test_name, test_config, iterations):
         print(f"\n[{test_name}] Iteration {i}/{iterations} (best: {best_score:.4f})")
 
         current_params = copy.deepcopy(best_params)
-        suggestion = suggest_change(current_params, blacklist)
+        blocked = {p for p, until_iter in blacklist.cooldown.items() if i < until_iter}
+        suggestion = suggest_change(current_params, blacklisted_params=blocked)
 
         if not suggestion:
             print("  No suggestion available, skipping")
