@@ -279,11 +279,11 @@ def session_filter(timestamp, params):
 
     t = timestamp.time() if hasattr(timestamp, "time") else timestamp
 
-    # London only (UTC+3 -> UTC: -3 часа)
-    # 09:00-14:00 UTC+3 = 06:00-11:00 UTC
-    # NY отключён — оптимизируем London отдельно
+    # London: 09:00-14:00 UTC+3 = 06:00-11:00 UTC
+    # NY:     15:00-17:00 UTC+3 = 12:00-14:00 UTC
     main_windows = [
         (dtime(6, 0), dtime(11, 0)),
+        (dtime(12, 0), dtime(14, 0)),
     ]
 
     if params.get("silver_bullet_only", False):
