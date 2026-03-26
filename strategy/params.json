@@ -1,5 +1,5 @@
 {
-  "fvg_min_size_multiplier": 0.35,
+  "fvg_min_size_multiplier": 0.25,
   "fvg_entry_depth": 0.25,
   "ob_lookback": 12,
   "bos_swing_length": 8,
