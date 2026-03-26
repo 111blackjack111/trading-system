@@ -14,8 +14,8 @@ import os
 from datetime import time as dtime
 
 import numpy as np
+from data.news_calendar import load_calendar, CURRENCY_MAP
 import pandas as pd
-from smartmoneyconcepts import smc
 
 PARAMS_PATH = os.path.join(os.path.dirname(__file__), "params.json")
 
@@ -274,29 +274,28 @@ def calculate_atr(df, period=14):
 # ============================================================
 
 def session_filter(timestamp, params):
-    """Проверяет временное окно (UTC+3, Kyiv)."""
+    """Проверяет временное окно (UTC+2, Kyiv)."""
     if not params.get("session_filter", True):
         return True
 
     t = timestamp.time() if hasattr(timestamp, "time") else timestamp
 
-    # Основные окна (UTC+3 -> UTC: -3 часа)
-    # 09:00-14:00 UTC+3 = 06:00-11:00 UTC
-    # 15:00-17:00 UTC+3 = 12:00-14:00 UTC
+    # London only (UTC+2 -> UTC: -2 часа)
+    # 09:00-14:00 UTC+2 = 07:00-12:00 UTC
+    # NY отключён — оптимизируем London отдельно
     main_windows = [
-        (dtime(6, 0), dtime(11, 0)),
-        (dtime(12, 0), dtime(14, 0)),
+        (dtime(7, 0), dtime(12, 0)),
     ]
 
     if params.get("silver_bullet_only", False):
         # Silver Bullet окна (UTC):
-        # 10:00-11:00 UTC+3 = 07:00-08:00 UTC
-        # 17:00-18:00 UTC+3 = 14:00-15:00 UTC
-        # 21:00-22:00 UTC+3 = 18:00-19:00 UTC
+        # 10:00-11:00 UTC+2 = 08:00-09:00 UTC
+        # 17:00-18:00 UTC+2 = 15:00-16:00 UTC
+        # 21:00-22:00 UTC+2 = 19:00-20:00 UTC
         sb_windows = [
-            (dtime(7, 0), dtime(8, 0)),
-            (dtime(14, 0), dtime(15, 0)),
-            (dtime(18, 0), dtime(19, 0)),
+            (dtime(8, 0), dtime(9, 0)),
+            (dtime(15, 0), dtime(16, 0)),
+            (dtime(19, 0), dtime(20, 0)),
         ]
         return any(start <= t <= end for start, end in sb_windows)
 
@@ -317,20 +316,20 @@ def is_monday_opening(timestamp):
     if hasattr(timestamp, "weekday"):
         if timestamp.weekday() == 0:  # Monday
             t = timestamp.time() if hasattr(timestamp, "time") else timestamp
-            return t < dtime(8, 0)  # до 08:00 UTC = 11:00 UTC+3
+            return t < dtime(8, 0)  # до 08:00 UTC = 10:00 UTC+2
     return False
 
 
 def is_after_close(timestamp):
-    """Закрыть все до 22:00 UTC+3 = 19:00 UTC."""
+    """Закрыть все до 22:00 UTC+2 = 20:00 UTC."""
     t = timestamp.time() if hasattr(timestamp, "time") else timestamp
-    return t >= dtime(19, 0)
+    return t >= dtime(20, 0)
 
 
 def is_asian_session(timestamp):
-    """Asian session: 00:00-06:00 UTC (03:00-09:00 UTC+3). Worst WR for forex."""
+    """Asian session: 01:00-07:00 UTC (03:00-09:00 UTC+2). Worst WR for forex."""
     t = timestamp.time() if hasattr(timestamp, "time") else timestamp
-    return t < dtime(6, 0)
+    return t < dtime(7, 0)
 
 
 # ============================================================
@@ -436,25 +435,83 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
     h1_time_to_idx = {ts: i for i, ts in enumerate(df_h1.index)}
 
     # 4. Ищем входы на M3
-    for i in range(1, len(df_m3)):
+    # Performance: find earliest FVG timestamp to skip early M3 bars
+    if active_fvgs:
+        earliest_fvg_ts = min(f["timestamp"] for f in active_fvgs)
+        start_idx = max(14, df_m3.index.searchsorted(earliest_fvg_ts) - 1)
+    else:
+        start_idx = len(df_m3)  # no FVGs = no signals possible
+
+    # Performance: pre-compute ATR volatility threshold once (was O(n^2) before)
+    percentile = params.get("min_atr_percentile", 40)
+    atr_threshold = np.nanpercentile(atr_m3.dropna().values, percentile) if params.get("volatility_filter", True) else 0.0
+
+    # Performance: pre-compute valid M3 indices using vectorized time filters
+    # This avoids calling Python functions for each of 244k+ M3 bars
+    valid_m3_mask = np.ones(len(df_m3), dtype=bool)
+    valid_m3_mask[:start_idx] = False
+    if not is_crypto:
+        m3_hours = df_m3.index.hour
+        m3_weekdays = df_m3.index.weekday
+        m3_times_minutes = m3_hours * 60 + df_m3.index.minute
+        # Session filter: London 07:00-12:00 UTC (vectorized)
+        if params.get("session_filter", True):
+            if params.get("silver_bullet_only", False):
+                sb_mask = (
+                    ((m3_hours >= 8) & (m3_hours < 9)) |
+                    ((m3_hours >= 15) & (m3_hours < 16)) |
+                    ((m3_hours >= 19) & (m3_hours < 20))
+                )
+                valid_m3_mask &= sb_mask
+            else:
+                session_mask = (m3_hours >= 7) & (m3_hours < 12)
+                valid_m3_mask &= session_mask
+        # Monday opening filter: skip before 08:00 UTC on Monday
+        monday_early = (m3_weekdays == 0) & (m3_hours < 8)
+        valid_m3_mask &= ~monday_early
+        # After close filter: skip after 20:00 UTC
+        valid_m3_mask &= (m3_hours < 20)
+    # News filter: pre-compute news blackout periods
+    _news_blackout_set = set()
+    if params.get("news_filter", True):
+        try:
+            _cal = load_calendar()
+            _affected_curr = set()
+            for _curr, _insts in CURRENCY_MAP.items():
+                if instrument in _insts:
+                    _affected_curr.add(_curr)
+            if _affected_curr:
+                _relevant = _cal[_cal["currency"].isin(_affected_curr)]
+                _news_minutes_before = params.get("news_minutes_before", 30)
+                _news_minutes_after = params.get("news_minutes_after", 30)
+                for _, _evt in _relevant.iterrows():
+                    _evt_time = pd.Timestamp(_evt["datetime"])
+                    _start = _evt_time - pd.Timedelta(minutes=_news_minutes_before)
+                    _end = _evt_time + pd.Timedelta(minutes=_news_minutes_after)
+                    # Mark all M3 bars in this window
+                    _mask = (df_m3.index >= _start) & (df_m3.index <= _end)
+                    _news_blackout_set.update(np.where(_mask)[0])
+        except Exception:
+            pass  # If calendar fails, don't block trades
+    if _news_blackout_set:
+        valid_m3_mask[list(_news_blackout_set)] = False
+
+    # Monday filter: optionally skip entire Monday
+    if params.get("monday_filter", False) and not is_crypto:
+        valid_m3_mask &= (df_m3.index.weekday != 0)
+
+    # Get indices of valid bars
+    valid_indices = np.where(valid_m3_mask)[0]
+
+    for i in valid_indices:
         ts = df_m3.index[i]
 
-        # Фильтры времени — для крипты отключены
-        if not is_crypto:
-            if is_monday_opening(ts):
-                continue
-            # Asian session filter (WR 20-24% на форексе — убыточно)
-            if params.get("asian_filter_forex", False) and is_asian_session(ts):
-                continue
-            if is_after_close(ts):
-                continue
-            if not session_filter(ts, params):
-                continue
+        # Quick exit if no FVGs remain
+        if not active_fvgs:
+            break
 
-        # Фильтр волатильности (работает для всех)
-        if i < 14:
-            continue
-        if not volatility_filter(atr_m3.iloc[i], atr_m3.iloc[:i], params):
+        # Фильтр волатильности (pre-computed threshold for performance)
+        if atr_m3.iloc[i] < atr_threshold:
             continue
 
         # Текущий H1 бар (округляем M3 timestamp до часа)
@@ -616,6 +673,34 @@ def simulate_trades(signals, df_m3, params, instrument=None):
         tp = signal["tp"]
         be_level = signal["be_level"]
         be_triggered = False
+        trailing_active = False
+
+        risk = signal["risk"]
+
+        # Trailing stop params
+        trail_enabled = params.get("trailing_stop_enabled", False)
+        trail_activation_rr = params.get("trailing_stop_activation_rr", 1.0)
+        trail_distance_rr = params.get("trailing_stop_distance_rr", 0.5)
+        trail_distance = trail_distance_rr * risk
+
+        # Partial TP params
+        partial_tp_enabled = params.get("partial_tp_enabled", False)
+        partial_tp_rr = params.get("partial_tp_rr", 1.0)
+        partial_tp_pct = params.get("partial_tp_pct", 0.5)
+        partial_tp_taken = False
+        partial_tp_r_locked = 0.0  # R locked in from partial close
+
+        if direction == "long":
+            partial_tp_price = entry + risk * partial_tp_rr
+        else:
+            partial_tp_price = entry - risk * partial_tp_rr
+
+        if direction == "long":
+            trail_activation_price = entry + risk * trail_activation_rr
+        else:
+            trail_activation_price = entry - risk * trail_activation_rr
+
+        trailing_sl = None  # Will be set when trailing activates
 
         # Ищем выход после входа
         mask = df_m3.index > entry_time
@@ -624,12 +709,24 @@ def simulate_trades(signals, df_m3, params, instrument=None):
         result = None
         exit_time = None
         exit_price = None
+        mfe_r = 0.0  # Maximum Favorable Excursion (в R)
+        mae_r = 0.0  # Maximum Adverse Excursion (в R)
 
         for j in range(len(future_bars)):
             bar = future_bars.iloc[j]
             bar_time = future_bars.index[j]
 
-            # Закрытие до 22:00 UTC+3 — только для форекс
+            # Track MFE/MAE
+            if direction == "long":
+                bar_mfe = (bar["high"] - entry) / risk
+                bar_mae = (entry - bar["low"]) / risk
+            else:
+                bar_mfe = (entry - bar["low"]) / risk
+                bar_mae = (bar["high"] - entry) / risk
+            mfe_r = max(mfe_r, bar_mfe)
+            mae_r = max(mae_r, bar_mae)
+
+            # Закрытие до 22:00 UTC+2 — только для форекс
             if not is_crypto and is_after_close(bar_time):
                 exit_price = bar["close"]
                 exit_time = bar_time
@@ -637,16 +734,41 @@ def simulate_trades(signals, df_m3, params, instrument=None):
                 break
 
             if direction == "long":
-                # Проверяем BE
-                if not be_triggered and bar["high"] >= be_level:
-                    be_triggered = True
-                    sl = entry  # SL на entry (безубыток)
+                # Partial TP: close portion at intermediate target
+                if partial_tp_enabled and not partial_tp_taken and bar["high"] >= partial_tp_price:
+                    partial_tp_taken = True
+                    partial_tp_r_locked = partial_tp_pct * partial_tp_rr
+                    # Move SL to BE for remainder
+                    if not trailing_active:
+                        sl = entry
+                        be_triggered = True
 
-                # SL
+                # Trailing stop logic
+                if trail_enabled:
+                    if not trailing_active and bar["high"] >= trail_activation_price:
+                        trailing_active = True
+                        trailing_sl = bar["high"] - trail_distance
+                        sl = max(sl, trailing_sl)  # Never move SL down
+                    elif trailing_active:
+                        new_trail = bar["high"] - trail_distance
+                        if new_trail > sl:
+                            sl = new_trail
+                else:
+                    # Original BE logic
+                    if not be_triggered and bar["high"] >= be_level:
+                        be_triggered = True
+                        sl = entry
+
+                # SL hit
                 if bar["low"] <= sl:
                     exit_price = sl
                     exit_time = bar_time
-                    result = "sl" if not be_triggered else "be"
+                    if trailing_active:
+                        result = "trail"
+                    elif be_triggered:
+                        result = "be"
+                    else:
+                        result = "sl"
                     break
 
                 # TP
@@ -657,16 +779,43 @@ def simulate_trades(signals, df_m3, params, instrument=None):
                     break
 
             elif direction == "short":
-                if not be_triggered and bar["low"] <= be_level:
-                    be_triggered = True
-                    sl = entry
+                # Partial TP: close portion at intermediate target
+                if partial_tp_enabled and not partial_tp_taken and bar["low"] <= partial_tp_price:
+                    partial_tp_taken = True
+                    partial_tp_r_locked = partial_tp_pct * partial_tp_rr
+                    # Move SL to BE for remainder
+                    if not trailing_active:
+                        sl = entry
+                        be_triggered = True
 
+                # Trailing stop logic for short
+                if trail_enabled:
+                    if not trailing_active and bar["low"] <= trail_activation_price:
+                        trailing_active = True
+                        trailing_sl = bar["low"] + trail_distance
+                        sl = min(sl, trailing_sl)  # Never move SL up (for short)
+                    elif trailing_active:
+                        new_trail = bar["low"] + trail_distance
+                        if new_trail < sl:
+                            sl = new_trail
+                else:
+                    if not be_triggered and bar["low"] <= be_level:
+                        be_triggered = True
+                        sl = entry
+
+                # SL hit
                 if bar["high"] >= sl:
                     exit_price = sl
                     exit_time = bar_time
-                    result = "sl" if not be_triggered else "be"
+                    if trailing_active:
+                        result = "trail"
+                    elif be_triggered:
+                        result = "be"
+                    else:
+                        result = "sl"
                     break
 
+                # TP
                 if bar["low"] <= tp:
                     exit_price = tp
                     exit_time = bar_time
@@ -677,7 +826,13 @@ def simulate_trades(signals, df_m3, params, instrument=None):
             # Сделка не закрылась в данных
             continue
 
-        pnl_r = (exit_price - entry) / signal["risk"] if direction == "long" else (entry - exit_price) / signal["risk"]
+        # Calculate PnL accounting for partial TP
+        remainder_pct = 1.0 - partial_tp_pct if partial_tp_taken else 1.0
+        raw_pnl_r = (exit_price - entry) / risk if direction == "long" else (entry - exit_price) / risk
+        if partial_tp_taken:
+            pnl_r = partial_tp_r_locked + remainder_pct * raw_pnl_r
+        else:
+            pnl_r = raw_pnl_r
 
         trades.append({
             "entry_time": entry_time,
@@ -689,6 +844,10 @@ def simulate_trades(signals, df_m3, params, instrument=None):
             "tp": tp,
             "result": result,
             "pnl_r": round(pnl_r, 4),
+            "mfe_r": round(mfe_r, 4),
+            "mae_r": round(mae_r, 4),
+            "bars_held": j + 1,
+            "partial_tp_taken": partial_tp_taken,
         })
 
     return trades

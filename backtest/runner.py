@@ -25,11 +25,15 @@ RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
 
 
 def load_data(instrument, timeframe):
-    """Загружает CSV файл с данными."""
+    """Загружает CSV файл с данными, ограничивая последними 4 годами."""
     filepath = os.path.join(CSV_DIR, f"{instrument}_{timeframe}.csv")
     if not os.path.exists(filepath):
         return None
     df = pd.read_csv(filepath, index_col="timestamp", parse_dates=True)
+    # Limit to last 2 years to keep backtests fast (~30 trades/year on GBP_USD)
+    # 2 years = ~60-100 trades, enough for statistical significance
+    cutoff = pd.Timestamp.now() - pd.DateOffset(years=2)
+    df = df[df.index >= cutoff]
     return df
 
 
@@ -64,21 +68,22 @@ def calculate_metrics(trades):
     profit_factor = gross_profit / gross_loss
 
     # Sharpe ratio (annualized, assuming ~252 trading days)
+    # Capped to [-3, 3] — with <200 trades, extreme values are noise
     if len(pnls) > 1:
         mean_pnl = np.mean(pnls)
         std_pnl = np.std(pnls, ddof=1)
         sharpe = (mean_pnl / std_pnl) * math.sqrt(252) if std_pnl > 0 else 0
+        sharpe = max(-3.0, min(3.0, sharpe))
     else:
         sharpe = 0
 
-    # Max drawdown (в R-множителях)
+    # Max drawdown (в R-множителях, абсолютный — не нормализованный к пику)
     cumulative = np.cumsum(pnls)
     peak = np.maximum.accumulate(cumulative)
     drawdown = (peak - cumulative)
-    max_drawdown = np.max(drawdown) if len(drawdown) > 0 else 0
-    # Нормализуем к доле от пика (cap at 1.0 to avoid explosion when peak ≈ 0)
-    peak_val = abs(peak.max())
-    max_dd_pct = max_drawdown / (peak_val + 0.001) if peak_val > 0.1 else min(max_drawdown, 1.0)
+    max_drawdown_abs = float(np.max(drawdown)) if len(drawdown) > 0 else 0
+    # Нормализуем к количеству сделок (dd per 100 trades) — стабильная метрика
+    max_dd_pct = max_drawdown_abs / max(total, 1) * 100
 
     avg_rr = np.mean(pnls)
 
@@ -99,21 +104,21 @@ def calculate_metrics(trades):
 
 def calculate_score(sharpe, profit_factor, max_drawdown, winrate, total_trades):
     """
-    Composite score v3 — quality-focused.
-    quality = winrate * profit_factor (качество сделок)
-    score = sharpe * 0.35 + quality * 0.35 - max_drawdown * 0.2 + 0.1
+    Composite score v4 — stable & quality-focused.
+    max_drawdown here is dd_per_100_trades (absolute R normalized by trade count).
+    sharpe is capped to [-3, 3].
+    No double penalty. Single clear formula.
     """
     if total_trades < 10:
-        return -999  # Недостаточно сделок — не считать улучшением
+        return -999
 
-    quality = winrate * profit_factor
+    quality = winrate * profit_factor  # WR × PF: core metric
 
-    # Плавный штраф за drawdown
-    dd_penalty = max(0, max_drawdown - 0.10) * 3.0
+    # Single drawdown penalty: dd_per_100 above 5R is penalized
+    dd_penalty = max(0, max_drawdown - 5.0) * 0.1
 
-    score = (sharpe * 0.35
-             + quality * 0.35
-             - max_drawdown * 0.2
+    score = (sharpe * 0.25
+             + quality * 0.45
              + 0.1
              - dd_penalty)
 
@@ -162,18 +167,26 @@ def run_backtest(instrument, params=None):
     }
 
 
-def run_all(params=None):
-    """Запускает бэктест по всем инструментам."""
+# Active instruments — only these are used for optimization
+CORE_INSTRUMENTS = {"GBP_USD", "EUR_GBP", "USD_JPY", "GBP_JPY", "EUR_USD"}
+
+
+def run_all(params=None, instruments_override=None):
+    """Запускает бэктест по активным инструментам."""
     if params is None:
         params = load_params()
 
-    # Определяем инструменты по наличию файлов
-    instruments = set()
-    if os.path.exists(CSV_DIR):
-        for f in os.listdir(CSV_DIR):
-            if f.endswith("_H1.csv"):
-                inst = f.replace("_H1.csv", "")
-                instruments.add(inst)
+    # Use override or CORE_INSTRUMENTS (not all CSV files!)
+    if instruments_override:
+        instruments = set(instruments_override)
+    else:
+        instruments = set()
+        if os.path.exists(CSV_DIR):
+            for f in os.listdir(CSV_DIR):
+                if f.endswith("_H1.csv"):
+                    inst = f.replace("_H1.csv", "")
+                    if inst in CORE_INSTRUMENTS:
+                        instruments.add(inst)
 
     results = {}
     for instrument in sorted(instruments):

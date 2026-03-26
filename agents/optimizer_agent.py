@@ -23,7 +23,7 @@ STRATEGY_PATH = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_
 # Диапазоны параметров для оптимизации
 # Общие параметры (применяются ко всем инструментам)
 PARAM_RANGES = {
-    # fvg_min_size_multiplier BLACKLISTED — даёт аномальные scores (-200/-400)
+    "fvg_min_size_multiplier": (0.1, 1.0),
     "fvg_entry_depth": (0.2, 0.8),
     "ob_lookback": (5, 30),
     "bos_swing_length": (5, 25),
@@ -42,11 +42,13 @@ PARAM_RANGES = {
     "forex_overrides.sl_atr_multiplier": (1.0, 3.0),
     "forex_overrides.tp_rr_ratio": (1.5, 3.0),
     "forex_overrides.min_atr_percentile": (20, 60),
+    "trailing_stop_activation_rr": (0.5, 2.0),
+    "trailing_stop_distance_rr": (0.2, 1.0),
 }
 
 
 def get_optimizer_model():
-    """Opus ночью (00-08 Kyiv/UTC+3), Sonnet днём. Экономим rate limit."""
+    """Opus ночью (00-08 Kyiv/UTC+2), Sonnet днём. Экономим rate limit."""
     from datetime import timezone, timedelta
     kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
     if kyiv_hour >= 24:

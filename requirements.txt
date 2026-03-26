@@ -1,4 +1,3 @@
-smartmoneyconcepts
 backtesting
 oandapyV20
 ccxt

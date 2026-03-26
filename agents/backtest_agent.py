@@ -26,22 +26,20 @@ DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
 # Проверенные пары (всегда активны) — только GBP_USD показывает стабильный положительный score
 CORE_INSTRUMENTS = {
-    "GBP_USD",
+    "GBP_USD", "EUR_GBP", "USD_JPY", "GBP_JPY",
 }
 
-# Тестовые пары для ночного режима — EUR_GBP и USD_JPY на испытательном
+# Тестовые пары для ночного режима — только пары с достаточной статистикой
+# Ночной режим: пары с отрицательным score для мониторинга
 NIGHT_INSTRUMENTS = {
-    "EUR_GBP", "USD_JPY",
-    "EUR_USD", "XAU_USD", "BTCUSDT", "NZD_JPY", "ETHUSDT",
-    "BNBUSDT", "SOLUSDT", "GBP_JPY", "GER40",
+    "EUR_USD", "XAU_USD",
 }
-
 # Обратная совместимость
 ACTIVE_INSTRUMENTS = CORE_INSTRUMENTS
 
 
 def is_night_mode():
-    """Ночной режим: 00:00-08:00 Kyiv (UTC+3) — расширенный набор инструментов + Opus."""
+    """Ночной режим: 00:00-08:00 Kyiv (UTC+2) — расширенный набор инструментов + Opus."""
     from datetime import timezone, timedelta
     kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
     if kyiv_hour >= 24:
@@ -59,7 +57,7 @@ def get_instruments():
                 inst = f.replace("_H1.csv", "")
                 if inst in active:
                     instruments.add(inst)
-    mode = "NIGHT (all 12)" if is_night_mode() else "DAY (core 4)"
+    mode = "NIGHT (all 12)" if is_night_mode() else "DAY (core 5)"
     print(f"  [Instruments] {mode}: {sorted(instruments)}")
     return sorted(instruments)
 
@@ -132,11 +130,11 @@ def classify_session(timestamp):
     if not hasattr(timestamp, "hour"):
         return "unknown"
     h = timestamp.hour
-    if 6 <= h < 11:     # London 09:00-14:00 UTC+3
+    if 7 <= h < 12:     # London 09:00-14:00 UTC+2 = 07:00-12:00 UTC
         return "london"
-    elif 12 <= h < 17:   # New York overlap + US 15:00-20:00 UTC+3
+    elif 13 <= h < 17:   # New York overlap + US 15:00-19:00 UTC+2 = 13:00-17:00 UTC
         return "new_york"
-    elif 0 <= h < 6:     # Asian 03:00-09:00 UTC+3
+    elif 1 <= h < 7:     # Asian 03:00-09:00 UTC+2 = 01:00-07:00 UTC
         return "asian"
     else:
         return "off_hours"
@@ -165,15 +163,15 @@ def generate_trade_log(results):
     losers = [t for t in all_trades if t.get("pnl_r", 0) < 0]
     losing_trades = []
     for t in losers[-20:]:
-        entry_time = t.get("entry_time")
-        exit_time = t.get("exit_time")
-        # Считаем bars_held (приблизительно: разница в минутах / 3)
-        bars_held = 0
-        if hasattr(entry_time, "timestamp") and hasattr(exit_time, "timestamp"):
-            bars_held = int((exit_time.timestamp() - entry_time.timestamp()) / 180)
+        bars_held = t.get("bars_held", 0)
+        if not bars_held:
+            entry_time = t.get("entry_time")
+            exit_time = t.get("exit_time")
+            if hasattr(entry_time, "timestamp") and hasattr(exit_time, "timestamp"):
+                bars_held = int((exit_time.timestamp() - entry_time.timestamp()) / 180)
         losing_trades.append({
             "instrument": t.get("instrument"),
-            "entry_time": str(entry_time),
+            "entry_time": str(t.get("entry_time")),
             "direction": t.get("direction"),
             "entry_price": t.get("entry"),
             "sl_price": t.get("sl"),
@@ -181,6 +179,8 @@ def generate_trade_log(results):
             "bars_held": bars_held,
             "exit_reason": t.get("result"),
             "pnl_r": t.get("pnl_r"),
+            "mfe_r": t.get("mfe_r", 0),
+            "mae_r": t.get("mae_r", 0),
         })
 
     # 2. Win by session
@@ -221,30 +221,41 @@ def generate_trade_log(results):
             "total_r": round(stats["pnl_sum"], 2),
         }
 
-    # 4. Avg bars to stop
+    # 4. Avg bars to stop (use bars_held from trade if available)
     sl_trades = [t for t in all_trades if t.get("result") == "sl"]
-    bars_to_stop = []
-    for t in sl_trades:
-        entry_time = t.get("entry_time")
-        exit_time = t.get("exit_time")
-        if hasattr(entry_time, "timestamp") and hasattr(exit_time, "timestamp"):
-            bars = int((exit_time.timestamp() - entry_time.timestamp()) / 180)
-            bars_to_stop.append(bars)
+    bars_to_stop = [t.get("bars_held", 0) for t in sl_trades if t.get("bars_held", 0) > 0]
+    if not bars_to_stop:
+        for t in sl_trades:
+            entry_time = t.get("entry_time")
+            exit_time = t.get("exit_time")
+            if hasattr(entry_time, "timestamp") and hasattr(exit_time, "timestamp"):
+                bars_to_stop.append(int((exit_time.timestamp() - entry_time.timestamp()) / 180))
 
     avg_bars_to_stop = round(sum(bars_to_stop) / len(bars_to_stop), 1) if bars_to_stop else 0
 
-    # 5. FVG age distribution (approximate from trade timing)
-    # We don't have fvg_age in trades directly, so we report by exit_reason breakdown
+    # 5. Exit reason breakdown with MFE/MAE
     exit_reasons = {}
     for t in all_trades:
         reason = t.get("result", "unknown")
         if reason not in exit_reasons:
-            exit_reasons[reason] = {"count": 0, "avg_pnl": 0, "total_pnl": 0}
+            exit_reasons[reason] = {"count": 0, "total_pnl": 0, "mfe_sum": 0, "mae_sum": 0}
         exit_reasons[reason]["count"] += 1
         exit_reasons[reason]["total_pnl"] += t.get("pnl_r", 0)
+        exit_reasons[reason]["mfe_sum"] += t.get("mfe_r", 0)
+        exit_reasons[reason]["mae_sum"] += t.get("mae_r", 0)
     for reason in exit_reasons:
         c = exit_reasons[reason]["count"]
         exit_reasons[reason]["avg_pnl"] = round(exit_reasons[reason]["total_pnl"] / c, 4) if c > 0 else 0
+        exit_reasons[reason]["avg_mfe"] = round(exit_reasons[reason]["mfe_sum"] / c, 4) if c > 0 else 0
+        exit_reasons[reason]["avg_mae"] = round(exit_reasons[reason]["mae_sum"] / c, 4) if c > 0 else 0
+        del exit_reasons[reason]["mfe_sum"]
+        del exit_reasons[reason]["mae_sum"]
+
+    # 6. MFE/MAE summary
+    all_mfe = [t.get("mfe_r", 0) for t in all_trades]
+    all_mae = [t.get("mae_r", 0) for t in all_trades]
+    be_trades = [t for t in all_trades if t.get("result") == "be"]
+    be_mfe = [t.get("mfe_r", 0) for t in be_trades]
 
     trade_log = {
         "total_trades": len(all_trades),
@@ -254,6 +265,12 @@ def generate_trade_log(results):
         "win_by_instrument": win_by_instrument,
         "avg_bars_to_stop": avg_bars_to_stop,
         "exit_reason_breakdown": exit_reasons,
+        "mfe_mae_summary": {
+            "avg_mfe": round(sum(all_mfe) / len(all_mfe), 4) if all_mfe else 0,
+            "avg_mae": round(sum(all_mae) / len(all_mae), 4) if all_mae else 0,
+            "be_avg_mfe": round(sum(be_mfe) / len(be_mfe), 4) if be_mfe else 0,
+            "be_count": len(be_trades),
+        },
     }
 
     db_save_trade_log(None, trade_log)
@@ -340,16 +357,21 @@ def watch():
                     "results": {k: v.get("metrics") for k, v in results.items()},
                     "timestamp": time.time(),
                 }
-                with open(DONE_FILE, "w") as f:
+                # Atomic write: write to temp file then rename to prevent partial reads
+                tmp_done = DONE_FILE + ".tmp"
+                with open(tmp_done, "w") as f:
                     json.dump(done, f, indent=2)
+                os.rename(tmp_done, DONE_FILE)
 
                 print(f"[BacktestAgent] Request #{request_id} done. avg_score={avg_score:.4f}")
 
             except Exception as e:
                 print(f"[BacktestAgent] Error: {e}")
                 # Пишем ошибку
-                with open(DONE_FILE, "w") as f:
+                tmp_done = DONE_FILE + ".tmp"
+                with open(tmp_done, "w") as f:
                     json.dump({"error": str(e)}, f)
+                os.rename(tmp_done, DONE_FILE)
 
         time.sleep(2)
 

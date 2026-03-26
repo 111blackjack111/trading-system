@@ -105,13 +105,13 @@ def save_experiment(iteration, suggestion, metrics_all, action, params):
 
 
 def get_avg_score(metrics_all):
-    """Считает средний score по всем инструментам."""
+    """Считает средний score по всем инструментам (игнорирует -999 penalty)."""
     scores = []
     for inst, res in metrics_all.items():
         m = res.get("metrics")
-        if m and m.get("score") is not None:
+        if m and m.get("score") is not None and m["score"] > -900:
             scores.append(m["score"])
-    return sum(scores) / len(scores) if scores else 0
+    return sum(scores) / len(scores) if scores else -999
 
 
 def run(max_iterations=100, skip_data_download=False):
@@ -122,10 +122,23 @@ def run(max_iterations=100, skip_data_download=False):
     print(f"ORCHESTRATOR: Starting autoresearch ({max_iterations} iterations)")
     print("=" * 60)
 
-    # Шаг 0: Скачиваем данные (один раз)
+    # Шаг 0: Скачиваем данные только если устарели (>24ч) или отсутствуют
     if not skip_data_download:
-        print("\n[Step 0] Downloading data...")
-        run_data_agent(months=12)
+        import time as _time
+        csv_dir = os.path.join(os.path.dirname(__file__), "..", "data", "csv")
+        need_download = False
+        check_file = os.path.join(csv_dir, "GBP_USD_H1.csv")
+        if not os.path.exists(check_file):
+            need_download = True
+            print("\n[Step 0] No data found, downloading...")
+        elif _time.time() - os.path.getmtime(check_file) > 86400:
+            need_download = True
+            print("\n[Step 0] Data older than 24h, updating...")
+        else:
+            age_h = (_time.time() - os.path.getmtime(check_file)) / 3600
+            print(f"\n[Step 0] Data fresh ({age_h:.1f}h old), skipping download")
+        if need_download:
+            run_data_agent(months=48)
 
     # Шаг 1: Baseline — бэктест с текущими параметрами
     print("\n[Iteration 0] Baseline backtest...")

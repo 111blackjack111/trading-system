@@ -30,11 +30,12 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
-TIMEOUT_BACKTEST = 5400  # 60 минут макс (5 лет × 12 инструментов = тяжёлый бэктест)
+TIMEOUT_BACKTEST_DAY = 1800   # 30 min for 1-2 core instruments (GBP_USD only during day)
+TIMEOUT_BACKTEST_NIGHT = 3600  # 60 min for 7 instruments during night
 
 
 def is_night_mode():
-    """Ночной режим: 00:00-08:00 Kyiv (UTC+3). Opus + все инструменты + автономия."""
+    """Ночной режим: 00:00-08:00 Kyiv (UTC+2). Opus + все инструменты + автономия."""
     kyiv_hour = datetime.now(timezone.utc).hour + 2  # UTC+2 (EET)
     if kyiv_hour >= 24:
         kyiv_hour -= 24
@@ -258,15 +259,19 @@ def request_backtest(params, request_id, changed_param=""):
     if os.path.exists(DONE_FILE):
         os.remove(DONE_FILE)
     request = {"id": request_id, "params": params, "timestamp": time.time(), "changed_param": changed_param}
-    with open(REQUEST_FILE, "w") as f:
+    # Atomic write: temp file + rename to prevent partial reads
+    tmp_req = REQUEST_FILE + ".tmp"
+    with open(tmp_req, "w") as f:
         json.dump(request, f, indent=2)
+    os.rename(tmp_req, REQUEST_FILE)
     group = "crypto" if changed_param.startswith("crypto_overrides.") else ("forex" if changed_param.startswith("forex_overrides.") else "all")
     print(f"  [Orchestrator] Backtest request #{request_id} sent (group: {group})")
 
 
 def wait_for_backtest(request_id):
+    timeout = TIMEOUT_BACKTEST_NIGHT if is_night_mode() else TIMEOUT_BACKTEST_DAY
     start = time.time()
-    while time.time() - start < TIMEOUT_BACKTEST:
+    while time.time() - start < timeout:
         if os.path.exists(DONE_FILE):
             with open(DONE_FILE) as f:
                 result = json.load(f)
