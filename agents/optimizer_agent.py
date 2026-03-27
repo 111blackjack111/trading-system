@@ -44,6 +44,8 @@ PARAM_RANGES = {
     "forex_overrides.min_atr_percentile": (20, 60),
     "trailing_stop_activation_rr": (0.5, 2.0),
     "trailing_stop_distance_rr": (0.2, 1.0),
+    "partial_tp_rr": (0.5, 2.0),
+    "partial_tp_pct": (0.3, 0.7),
 }
 
 
@@ -328,15 +330,27 @@ NOTE: sharpe is capped [-3, 3]. dd is absolute R drawdown per 100 trades, not ra
 7. Think about WHY a change might help based on SMC logic
 8. Try crypto_overrides and forex_overrides separately — they behave differently
 9. Small steps (10-20% change) are better than large jumps
+10. You can suggest 1 to 3 parameter changes at once (multi-param combo)
+11. Multi-param combos are useful when parameters interact (e.g. tp_rr + be_trigger + partial_tp_rr)
 
 ## Response Format (JSON only)
-For parameter changes:
+For single parameter change:
 {{
     "type": "param_change",
     "param": "parameter_name",
     "old_value": current_value,
     "new_value": suggested_value,
     "reasoning": "Brief explanation based on trade_log analysis"
+}}
+
+For multi-parameter combo (2-3 params at once):
+{{
+    "type": "multi_param_change",
+    "changes": [
+        {{"param": "param1", "old_value": v1, "new_value": v2}},
+        {{"param": "param2", "old_value": v3, "new_value": v4}}
+    ],
+    "reasoning": "Brief explanation of why these params interact"
 }}"""
 
     return prompt
@@ -399,8 +413,31 @@ def suggest_change(params=None, blacklisted_params=None):
         suggestion["old_value"] = 0
         suggestion["new_value"] = 0
 
+    elif change_type == "multi_param_change":
+        # Мульти-параметр: валидируем каждый
+        changes = suggestion.get("changes", [])
+        if not changes or len(changes) > 3:
+            raise ValueError(f"multi_param_change must have 1-3 changes, got {len(changes)}")
+        for ch in changes:
+            p = ch.get("param")
+            if not p or p not in PARAM_RANGES:
+                raise ValueError(f"Unknown parameter in multi: {p}")
+            low, high = PARAM_RANGES[p]
+            if not (low <= ch["new_value"] <= high):
+                raise ValueError(f"{p}={ch['new_value']} out of range [{low}, {high}]")
+
+        # Для совместимости: param = первый параметр (для blacklist/dedup)
+        suggestion["param"] = "+".join(ch["param"] for ch in changes)
+        suggestion["old_value"] = {ch["param"]: ch["old_value"] for ch in changes}
+        suggestion["new_value"] = {ch["param"]: ch["new_value"] for ch in changes}
+
+        print(f"  Multi-param combo ({len(changes)}):")
+        for ch in changes:
+            print(f"    {ch['param']} {ch.get('old_value')} -> {ch['new_value']}")
+        print(f"  Reasoning: {suggestion.get('reasoning', 'N/A')}")
+
     else:
-        # Параметр
+        # Одиночный параметр
         param = suggestion.get("param")
         if not param or param not in PARAM_RANGES:
             raise ValueError(f"Unknown parameter: {param}")

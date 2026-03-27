@@ -484,7 +484,20 @@ def run(max_iterations=100, skip_data_download=False):
                 continue
         else:
             new_params = params_backup.copy()
-            if "." in param_name:
+            change_type = suggestion.get("type", "param_change")
+
+            if change_type == "multi_param_change":
+                # Применяем несколько параметров
+                for ch in suggestion.get("changes", []):
+                    p = ch["param"]
+                    if "." in p:
+                        group, key = p.split(".", 1)
+                        if group not in new_params:
+                            new_params[group] = {}
+                        new_params[group][key] = ch["new_value"]
+                    else:
+                        new_params[p] = ch["new_value"]
+            elif "." in param_name:
                 group, key = param_name.split(".", 1)
                 if group not in new_params:
                     new_params[group] = {}
