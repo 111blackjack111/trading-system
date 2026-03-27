@@ -272,7 +272,7 @@ def calculate_atr(df, period=14):
 # Фильтры
 # ============================================================
 
-def session_filter(timestamp, params):
+def session_filter(timestamp, params, instrument=None):
     """Проверяет временное окно (UTC+3, Kyiv)."""
     if not params.get("session_filter", True):
         return True
@@ -282,6 +282,12 @@ def session_filter(timestamp, params):
     # London: 09:00-14:00 UTC+3 = 06:00-11:00 UTC
     # NY:     15:00-17:00 UTC+3 = 12:00-14:00 UTC
     ny_enabled = params.get("ny_session", False)
+
+    # Per-instrument NY override: ny_instruments = ["USD_JPY", ...]
+    ny_instruments = params.get("ny_instruments", [])
+    if instrument and instrument in ny_instruments:
+        ny_enabled = True
+
     main_windows = [
         (dtime(6, 0), dtime(11, 0)),
     ]
@@ -448,7 +454,7 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                 continue
             if is_after_close(ts):
                 continue
-            if not session_filter(ts, params):
+            if not session_filter(ts, params, instrument=instrument):
                 continue
 
         # Фильтр волатильности (работает для всех)
@@ -608,6 +614,11 @@ def simulate_trades(signals, df_m3, params, instrument=None):
     is_crypto = is_crypto_instrument(instrument)
     trades = []
 
+    # Partial TP params
+    partial_tp_on = params.get("partial_tp_enabled", False)
+    partial_tp_rr = params.get("partial_tp_rr", 1.0)
+    partial_tp_pct = params.get("partial_tp_pct", 0.5)
+
     for signal in signals:
         entry_time = signal["timestamp"]
         direction = signal["direction"]
@@ -616,6 +627,14 @@ def simulate_trades(signals, df_m3, params, instrument=None):
         tp = signal["tp"]
         be_level = signal["be_level"]
         be_triggered = False
+        partial_taken = False
+
+        # Partial TP level
+        risk = signal["risk"]
+        if direction == "long":
+            partial_tp_price = entry + risk * partial_tp_rr
+        else:
+            partial_tp_price = entry - risk * partial_tp_rr
 
         # Ищем выход после входа
         mask = df_m3.index > entry_time
@@ -624,7 +643,6 @@ def simulate_trades(signals, df_m3, params, instrument=None):
         result = None
         exit_time = None
         exit_price = None
-        risk = signal["risk"]
         mfe_r = 0.0  # Maximum Favorable Excursion (в R)
         mae_r = 0.0  # Maximum Adverse Excursion (в R)
 
@@ -650,6 +668,10 @@ def simulate_trades(signals, df_m3, params, instrument=None):
                 break
 
             if direction == "long":
+                # Partial TP: фиксируем часть на partial_tp_rr
+                if partial_tp_on and not partial_taken and bar["high"] >= partial_tp_price:
+                    partial_taken = True
+
                 # Проверяем BE
                 if not be_triggered and bar["high"] >= be_level:
                     be_triggered = True
@@ -670,6 +692,10 @@ def simulate_trades(signals, df_m3, params, instrument=None):
                     break
 
             elif direction == "short":
+                # Partial TP
+                if partial_tp_on and not partial_taken and bar["low"] <= partial_tp_price:
+                    partial_taken = True
+
                 if not be_triggered and bar["low"] <= be_level:
                     be_triggered = True
                     sl = entry
@@ -690,7 +716,16 @@ def simulate_trades(signals, df_m3, params, instrument=None):
             # Сделка не закрылась в данных
             continue
 
-        pnl_r = (exit_price - entry) / risk if direction == "long" else (entry - exit_price) / risk
+        # PnL: если partial TP был взят, считаем средневзвешенно
+        remaining_pnl_r = (exit_price - entry) / risk if direction == "long" else (entry - exit_price) / risk
+
+        if partial_taken and partial_tp_on:
+            # partial_pct закрыт на partial_tp_rr, остаток на exit_price
+            pnl_r = partial_tp_pct * partial_tp_rr + (1 - partial_tp_pct) * remaining_pnl_r
+            result_label = f"partial_{result}"  # e.g. "partial_be", "partial_tp"
+        else:
+            pnl_r = remaining_pnl_r
+            result_label = result
 
         trades.append({
             "entry_time": entry_time,
@@ -700,11 +735,12 @@ def simulate_trades(signals, df_m3, params, instrument=None):
             "exit": exit_price,
             "sl": signal["sl"],
             "tp": tp,
-            "result": result,
+            "result": result_label,
             "pnl_r": round(pnl_r, 4),
             "mfe_r": round(mfe_r, 4),
             "mae_r": round(mae_r, 4),
             "bars_held": j + 1,
+            "partial_taken": partial_taken,
         })
 
     return trades

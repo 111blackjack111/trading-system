@@ -29,7 +29,7 @@
     "tp_rr_ratio": 1.55,
     "min_atr_percentile": 35
   },
-  "partial_tp_enabled": false,
+  "partial_tp_enabled": true,
   "partial_tp_rr": 1.0,
   "partial_tp_pct": 0.5,
   "trailing_stop_enabled": true,
@@ -38,5 +38,6 @@
   "news_minutes_before": 30,
   "news_minutes_after": 30,
   "ny_session": false,
+  "ny_instruments": ["USD_JPY"],
   "monday_filter": false
 }
