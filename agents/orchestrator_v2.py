@@ -245,6 +245,16 @@ def init_db():
 
 def is_duplicate_experiment(param, new_value, tolerance=0.01):
     """Проверяет, был ли уже такой (param, value) в экспериментах."""
+    # Multi-param combo: new_value может быть dict — сравниваем как строку
+    if isinstance(new_value, (dict, list)):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.execute(
+            "SELECT COUNT(*) FROM experiments WHERE param_changed = ? AND new_value = ?",
+            (param, str(new_value))
+        )
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.execute(
         "SELECT COUNT(*) FROM experiments WHERE param_changed = ? AND ABS(new_value - ?) < ?",
@@ -274,11 +284,20 @@ def wait_for_backtest(request_id):
     start = time.time()
     while time.time() - start < timeout:
         if os.path.exists(DONE_FILE):
-            with open(DONE_FILE) as f:
-                result = json.load(f)
+            try:
+                with open(DONE_FILE) as f:
+                    result = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                # Partial write — wait for atomic rename to complete
+                time.sleep(1)
+                continue
             if result.get("id") == request_id or "error" in result:
                 os.remove(DONE_FILE)
                 return result
+            else:
+                # Stale done file from previous run — discard and keep waiting
+                print(f"  [Orchestrator] Stale done file (id={result.get('id')}), expected {request_id} — discarding")
+                os.remove(DONE_FILE)
         time.sleep(2)
     print("  [Orchestrator] WARNING: Backtest timeout!")
     return {"error": "timeout", "avg_score": 0, "results": {}}
@@ -389,6 +408,12 @@ def run(max_iterations=100, skip_data_download=False):
     init_db()
     blacklist = ParamBlacklist()
 
+    # === STARTUP CLEANUP — предотвращает зависание на stale файлах ===
+    for stale_file in [REQUEST_FILE, DONE_FILE]:
+        if os.path.exists(stale_file):
+            os.remove(stale_file)
+            print(f"  [Cleanup] Removed stale {os.path.basename(stale_file)}")
+
     print("=" * 60)
     print(f"ORCHESTRATOR v3: Autoresearch ({max_iterations} iterations)")
     print("  Blacklist: ON | Stuck detector: ON | Conflict detector: ON")
@@ -418,7 +443,9 @@ def run(max_iterations=100, skip_data_download=False):
     night_results = {}  # {instrument: {score, trades, winrate, total_r}} — для ночного отчёта
 
     # Шаг 2: Итерации
+    consecutive_errors = 0
     for i in range(1, max_iterations + 1):
+      try:
         night = is_night_mode()
         mode_str = "🌙 NIGHT (Opus+all)" if night else "☀️ DAY (Sonnet+core)"
         print(f"\n{'=' * 60}")
@@ -444,8 +471,9 @@ def run(max_iterations=100, skip_data_download=False):
             suggestion = suggest_change(params_backup, blacklisted_params=blocked)
         except Exception as e:
             print(f"  Optimizer error: {e}")
-            save_experiment(i, {"param": f"error: {e}", "old_value": 0, "new_value": 0, "reasoning": str(e)},
+            save_experiment(i, {"param": f"error: {str(e)[:100]}", "old_value": 0, "new_value": 0, "reasoning": str(e)},
                            {"avg_score": 0, "results": {}}, "error", params_backup)
+            time.sleep(5)  # Brief pause before retry
             continue
 
         param_name = suggestion.get("param", "")
@@ -699,6 +727,29 @@ def run(max_iterations=100, skip_data_download=False):
                             )
             except Exception as e:
                 print(f"  [Analyst] Error: {e}")
+
+      except Exception as iteration_error:
+        # === CRASH PROTECTION — никогда не убиваем весь процесс ===
+        consecutive_errors += 1
+        error_msg = str(iteration_error)[:200]
+        print(f"\n  [CRASH PROTECTION] Iteration {i} failed: {error_msg}")
+        try:
+            # Restore params if we modified them
+            if 'params_backup' in dir():
+                save_params(params_backup)
+            save_experiment(i, {"param": f"crash: {error_msg}", "old_value": 0, "new_value": 0, "reasoning": error_msg},
+                           {"avg_score": 0, "results": {}}, "error", params_backup if 'params_backup' in dir() else load_params())
+        except Exception:
+            pass
+        if consecutive_errors >= 5:
+            send_telegram(f"🔴 <b>5 ошибок подряд!</b>\nПоследняя: {error_msg}\nОрхестратор продолжает работу")
+            consecutive_errors = 0
+        # Clean stale runtime files to prevent deadlock on next iteration
+        for f in [REQUEST_FILE, DONE_FILE]:
+            if os.path.exists(f):
+                os.remove(f)
+        time.sleep(10)
+        continue
 
     # Отправить ночной отчёт если закончили ночью
     if night_results:

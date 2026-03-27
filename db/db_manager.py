@@ -176,6 +176,13 @@ def get_latest_trade_log():
 
 # ── Suggestions ──
 
+def _serialize_value(v):
+    """Serialize dicts/lists to JSON string for SQLite storage."""
+    if isinstance(v, (dict, list)):
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
 def save_suggestion(iteration, suggestion):
     """Save optimizer suggestion."""
     conn = _conn()
@@ -186,8 +193,8 @@ def save_suggestion(iteration, suggestion):
             iteration,
             suggestion.get("type", "param_change"),
             suggestion.get("param", ""),
-            suggestion.get("old_value"),
-            suggestion.get("new_value"),
+            _serialize_value(suggestion.get("old_value")),
+            _serialize_value(suggestion.get("new_value")),
             suggestion.get("reasoning", ""),
         ),
     )

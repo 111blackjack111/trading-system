@@ -10,7 +10,7 @@
   "silver_bullet_only": false,
   "volatility_filter": true,
   "min_atr_percentile": 42,
-  "fvg_max_age_bars": 7,
+  "fvg_max_age_bars": 8,
   "confirmation_candle_pct": 0.5,
   "ob_confluence": true,
   "sweep_filter": false,
@@ -30,7 +30,7 @@
     "min_atr_percentile": 35
   },
   "partial_tp_enabled": true,
-  "partial_tp_rr": 1.0,
+  "partial_tp_rr": 1.15,
   "partial_tp_pct": 0.5,
   "trailing_stop_enabled": true,
   "trailing_stop_activation_rr": 1.2,
@@ -38,6 +38,8 @@
   "news_minutes_before": 30,
   "news_minutes_after": 30,
   "ny_session": false,
-  "ny_instruments": ["USD_JPY"],
+  "ny_instruments": [
+    "USD_JPY"
+  ],
   "monday_filter": false
 }
