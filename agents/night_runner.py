@@ -151,6 +151,9 @@ def run_test(test_name, test_config, iterations):
     best_score = baseline_score
     best_params = copy.deepcopy(base_params)
     blacklist = ParamBlacklist()
+    # Сбрасываем cooldown — night_runner тесты независимы от orchestrator
+    blacklist.cooldown.clear()
+    blacklist.revert_counts.clear()
 
     for i in range(1, iterations + 1):
         print(f"\n[{test_name}] Iteration {i}/{iterations} (best: {best_score:.4f})")
