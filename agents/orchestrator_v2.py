@@ -321,8 +321,8 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
     """, (
         iteration, now,
         suggestion.get("param", "baseline"),
-        suggestion.get("old_value", 0),
-        suggestion.get("new_value", 0),
+        str(suggestion.get("old_value", 0)),
+        str(suggestion.get("new_value", 0)),
         round(avg_score, 4), round(best_score, 4),
         best_inst, total_trades, avg_wr, avg_pf,
         action, suggestion.get("reasoning", ""),
