@@ -128,6 +128,12 @@ Exit breakdown:
 Sessions:
 {json.dumps(trade_log.get('win_by_session', {}), indent=2)}
 
+Win by hour (UTC):
+{json.dumps(trade_log.get('win_by_hour_utc', {}), indent=2)}
+
+MFE/MAE summary:
+{json.dumps(trade_log.get('mfe_mae_summary', {}), indent=2)}
+
 ## System State
 Consecutive reverts: {consecutive_reverts}
 Blacklisted params: {blacklist_info}

@@ -159,19 +159,30 @@ def generate_trade_log(results):
     if not all_trades:
         return {}
 
-    # 1. Losing trades (последние 20)
-    losers = [t for t in all_trades if t.get("pnl_r", 0) < 0]
-    losing_trades = []
-    for t in losers[-20:]:
+    # Helper: extract hour from entry_time
+    def get_entry_hour(t):
+        et = t.get("entry_time")
+        if hasattr(et, "hour"):
+            return et.hour
+        if isinstance(et, str) and len(et) >= 13:
+            try:
+                return int(et[11:13])
+            except (ValueError, IndexError):
+                return -1
+        return -1
+
+    # 1. Losing trades (последние 20) + winning trades (топ 10 by pnl)
+    def format_trade(t):
         bars_held = t.get("bars_held", 0)
         if not bars_held:
             entry_time = t.get("entry_time")
             exit_time = t.get("exit_time")
             if hasattr(entry_time, "timestamp") and hasattr(exit_time, "timestamp"):
                 bars_held = int((exit_time.timestamp() - entry_time.timestamp()) / 180)
-        losing_trades.append({
+        return {
             "instrument": t.get("instrument"),
             "entry_time": str(t.get("entry_time")),
+            "entry_hour_utc": get_entry_hour(t),
             "direction": t.get("direction"),
             "entry_price": t.get("entry"),
             "sl_price": t.get("sl"),
@@ -181,7 +192,13 @@ def generate_trade_log(results):
             "pnl_r": t.get("pnl_r"),
             "mfe_r": t.get("mfe_r", 0),
             "mae_r": t.get("mae_r", 0),
-        })
+        }
+
+    losers = [t for t in all_trades if t.get("pnl_r", 0) < 0]
+    losing_trades = [format_trade(t) for t in losers[-20:]]
+
+    winners = sorted([t for t in all_trades if t.get("pnl_r", 0) > 0], key=lambda x: x.get("pnl_r", 0), reverse=True)
+    winning_trades = [format_trade(t) for t in winners[:10]]
 
     # 2. Win by session
     session_stats = {}
@@ -257,12 +274,35 @@ def generate_trade_log(results):
     be_trades = [t for t in all_trades if t.get("result") == "be"]
     be_mfe = [t.get("mfe_r", 0) for t in be_trades]
 
+    # 7. Win rate by hour (UTC)
+    hour_stats = {}
+    for t in all_trades:
+        h = get_entry_hour(t)
+        if h < 0:
+            continue
+        if h not in hour_stats:
+            hour_stats[h] = {"wins": 0, "total": 0, "pnl_sum": 0}
+        hour_stats[h]["total"] += 1
+        hour_stats[h]["pnl_sum"] += t.get("pnl_r", 0)
+        if t.get("pnl_r", 0) > 0:
+            hour_stats[h]["wins"] += 1
+    win_by_hour = {}
+    for h in sorted(hour_stats.keys()):
+        s = hour_stats[h]
+        win_by_hour[str(h)] = {
+            "winrate": round(s["wins"] / s["total"], 4) if s["total"] > 0 else 0,
+            "total_trades": s["total"],
+            "total_r": round(s["pnl_sum"], 2),
+        }
+
     trade_log = {
         "total_trades": len(all_trades),
         "overall_winrate": round(len([t for t in all_trades if t.get("pnl_r", 0) > 0]) / len(all_trades), 4),
         "losing_trades": losing_trades,
+        "winning_trades": winning_trades,
         "win_by_session": win_by_session,
         "win_by_instrument": win_by_instrument,
+        "win_by_hour_utc": win_by_hour,
         "avg_bars_to_stop": avg_bars_to_stop,
         "exit_reason_breakdown": exit_reasons,
         "mfe_mae_summary": {

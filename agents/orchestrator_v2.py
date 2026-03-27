@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from strategy.base_strategy import load_params, save_params
 from agents.optimizer_agent import suggest_change, PARAM_RANGES
 from agents.analyst_agent import run_analysis, apply_recommendations
+from agents.trade_analyst import run_analysis as run_trade_analysis
 from agents.data_agent import run as run_data_agent
 
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
@@ -572,6 +573,34 @@ def run(max_iterations=100, skip_data_download=False):
 
         save_experiment(i, suggestion, bt_result, action, new_params)
 
+        # === OVERFITTING CHECK (on keep) ===
+        if action == "keep":
+            warnings = []
+            # Check 1: trades dropped more than 20%
+            baseline_trades = baseline_result.get("results", {})
+            baseline_total = sum(m.get("total_trades", 0) for m in baseline_trades.values() if m)
+            if baseline_total > 0 and total_trades_new < baseline_total * 0.8:
+                warnings.append(f"Trades dropped {baseline_total} -> {total_trades_new} ({total_trades_new/baseline_total:.0%})")
+
+            # Check 2: single instrument dominance (>60% of total score)
+            inst_results = bt_result.get("results", {})
+            inst_scores = {}
+            for inst, m in inst_results.items():
+                if m:
+                    s = m.get("score", m.get("metrics", {}).get("score", 0))
+                    inst_scores[inst] = s
+            if inst_scores:
+                total_score_abs = sum(abs(s) for s in inst_scores.values())
+                if total_score_abs > 0:
+                    for inst, s in inst_scores.items():
+                        if abs(s) / total_score_abs > 0.6:
+                            warnings.append(f"{inst} dominates score ({s:.2f} = {abs(s)/total_score_abs:.0%})")
+
+            if warnings:
+                warn_msg = " | ".join(warnings)
+                print(f"\n  [Overfitting] WARNING: {warn_msg}")
+                send_telegram(f"Overfitting warning (iter {i}):\n{warn_msg}")
+
         # === STUCK DETECTOR ===
         if consecutive_reverts >= 7 and not ranges_expanded:
             print(f"\n  [StuckDetector] {consecutive_reverts} reverts in a row!")
@@ -610,6 +639,26 @@ def run(max_iterations=100, skip_data_download=False):
                     )
                     print(f"  [Degradation] Auto-rollback! Score {old_score:.4f} → restored {snap_score:.4f}")
                     consecutive_reverts = 0
+
+        # === TRADE ANALYST (каждые 15 итераций — глубокий анализ сделок) ===
+        if i % 15 == 0:
+            try:
+                analysis = run_trade_analysis()
+                if analysis:
+                    summary = analysis.get("summary_ru", "")
+                    recs = analysis.get("recommendations", [])
+                    if summary:
+                        send_telegram(f"Trade Analysis:\n{summary}")
+                    # Высокоуверенные рекомендации → в Telegram для CEO
+                    for r in recs:
+                        if r.get("confidence", 0) >= 0.7:
+                            send_telegram(
+                                f"Trade Analyst rec ({r.get('confidence', 0):.0%}):\n"
+                                f"{r.get('description', '')}\n"
+                                f"Impact: {r.get('expected_impact', '')}"
+                            )
+            except Exception as e:
+                print(f"  [TradeAnalyst] Error: {e}")
 
         # === ANALYST AGENT (каждые 10 итераций) ===
         if i % 10 == 0:
