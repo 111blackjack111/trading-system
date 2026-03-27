@@ -481,18 +481,21 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                 if fvg_age > fvg_max_age:
                     continue  # FVG слишком старый — удаляем
 
-            # Liquidity Sweep: проверяем был ли sweep перед входом
+            # Liquidity Sweep: вход ТОЛЬКО после sweep в нужном направлении
             if use_sweep_filter and current_h1_idx is not None:
                 sweep = detect_liquidity_sweep(df_h1, current_h1_idx, swing_highs, swing_lows)
-                if sweep is not None:
-                    # Sweep есть — входим только если совпадает с направлением
-                    if fvg["type"] == "bullish" and sweep != "bullish_sweep":
-                        remaining_fvgs.append(fvg)
-                        continue
-                    if fvg["type"] == "bearish" and sweep != "bearish_sweep":
-                        remaining_fvgs.append(fvg)
-                        continue
-                    # sweep совпал — бонус к confidence (проходим дальше)
+                if sweep is None:
+                    # Нет sweep — не входим
+                    remaining_fvgs.append(fvg)
+                    continue
+                # Sweep есть — проверяем направление
+                if fvg["type"] == "bullish" and sweep != "bullish_sweep":
+                    remaining_fvgs.append(fvg)
+                    continue
+                if fvg["type"] == "bearish" and sweep != "bearish_sweep":
+                    remaining_fvgs.append(fvg)
+                    continue
+                # sweep совпал с FVG — входим
 
             close = df_m3["close"].iloc[i]
             low = df_m3["low"].iloc[i]
