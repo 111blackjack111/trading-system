@@ -29,10 +29,12 @@ CORE_INSTRUMENTS = {
     "GBP_USD", "EUR_GBP", "USD_JPY", "GBP_JPY",
 }
 
-# Тестовые пары для ночного режима — только пары с достаточной статистикой
-# Ночной режим: пары с отрицательным score для мониторинга
+# Тестовые пары для ночного режима — расширенный набор для тестирования
 NIGHT_INSTRUMENTS = {
     "EUR_USD", "XAU_USD",
+    "AUD_USD", "NZD_USD", "USD_CAD", "USD_CHF",
+    "EUR_JPY", "AUD_JPY", "CAD_JPY",
+    "EUR_AUD", "GBP_AUD", "GBP_CHF", "NZD_JPY",
 }
 # Обратная совместимость
 ACTIVE_INSTRUMENTS = CORE_INSTRUMENTS

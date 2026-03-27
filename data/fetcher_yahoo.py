@@ -20,6 +20,17 @@ INSTRUMENTS = {
     "GBP_JPY": "GBPJPY=X",
     "USD_JPY": "USDJPY=X",
     "EUR_GBP": "EURGBP=X",
+    "AUD_USD": "AUDUSD=X",
+    "NZD_USD": "NZDUSD=X",
+    "USD_CAD": "USDCAD=X",
+    "USD_CHF": "USDCHF=X",
+    "EUR_JPY": "EURJPY=X",
+    "AUD_JPY": "AUDJPY=X",
+    "CAD_JPY": "CADJPY=X",
+    "EUR_AUD": "EURAUD=X",
+    "GBP_AUD": "GBPAUD=X",
+    "GBP_CHF": "GBPCHF=X",
+    "NZD_JPY": "NZDJPY=X",
     "XAU_USD": "GC=F",       # Gold futures
     "GER40":   "^GDAXI",     # DAX index
 }
