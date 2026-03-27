@@ -157,7 +157,12 @@ def run_test(test_name, test_config, iterations):
 
         current_params = copy.deepcopy(best_params)
         blocked = {p for p, until_iter in blacklist.cooldown.items() if i < until_iter}
-        suggestion = suggest_change(current_params, blacklisted_params=blocked)
+        try:
+            suggestion = suggest_change(current_params, blacklisted_params=blocked)
+        except Exception as e:
+            print(f"  Optimizer error: {e}, skipping")
+            results["iterations"].append({"iter": i, "action": "skip", "reason": f"error: {e}"})
+            continue
 
         if not suggestion:
             print("  No suggestion available, skipping")
@@ -180,7 +185,14 @@ def run_test(test_name, test_config, iterations):
         for k, v in test_config["overrides"].items():
             new_params[k] = v
 
-        bt_result = run_backtest_direct(new_params)
+        try:
+            bt_result = run_backtest_direct(new_params)
+        except Exception as e:
+            print(f"  Backtest error: {e}, skipping")
+            save_params(best_params)
+            results["iterations"].append({"iter": i, "action": "skip", "reason": f"bt_error: {e}"})
+            continue
+
         new_score = bt_result.get("avg_score", 0)
         iter_trades = sum(
             m.get("total_trades", 0)
