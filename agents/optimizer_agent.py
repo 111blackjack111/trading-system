@@ -12,6 +12,18 @@ import sqlite3
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+
+def _sf(val, default=0.0):
+    """Safe float — handles None, strings, dicts."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 import config
 from strategy.base_strategy import load_params
 from db.db_manager import save_suggestion as db_save_suggestion
@@ -142,7 +154,12 @@ def format_tried_values(tried):
         return "None yet."
     lines = []
     for param, vals in sorted(tried.items()):
-        val_strs = [f"{v:.2f}({a},s={s})" for v, a, s in vals]
+        val_strs = []
+        for v, a, s in vals:
+            try:
+                val_strs.append(f"{float(v):.2f}({a},s={s})")
+            except (ValueError, TypeError):
+                val_strs.append(f"{v}({a},s={s})")
         lines.append(f"  {param}: {', '.join(val_strs)}")
     return "\n".join(lines)
 
@@ -160,7 +177,10 @@ def get_tried_values():
             param, val, action, score = row
             if param not in tried:
                 tried[param] = []
-            tried[param].append((val, action, round(score, 3)))
+            try:
+                tried[param].append((val, action, round(float(score or 0), 3)))
+            except (ValueError, TypeError):
+                tried[param].append((val, action, 0.0))
     except sqlite3.OperationalError:
         pass
     conn.close()
@@ -202,7 +222,11 @@ def compute_param_priority(history):
     lines = []
     for i, (param, score) in enumerate(sorted_params, 1):
         status = "⚠️ recently reverted" if param in recent_reverts else "✅ available"
-        lines.append(f"{i}. {param} (best score: {score:.2f}) — {status}")
+        try:
+            score_f = float(score)
+        except (ValueError, TypeError):
+            score_f = 0.0
+        lines.append(f"{i}. {param} (best score: {score_f:.2f}) — {status}")
 
     # Добавляем неисследованные
     explored = set(param_impact.keys())
@@ -220,7 +244,7 @@ def build_prompt(params, history, metrics, trade_log, allow_code_changes=False, 
     if trade_log:
         trade_log_section = f"""
 ## Trade Analysis (trade_log.json)
-Overall WR: {trade_log.get('overall_winrate', 0):.1%} ({trade_log.get('total_trades', 0)} trades)
+Overall WR: {_sf(trade_log.get('overall_winrate', 0)):.1%} ({trade_log.get('total_trades', 0)} trades)
 
 ### Win Rate by Session
 ```json

@@ -8,6 +8,7 @@ tmux kill-session -t orchestrator 2>/dev/null
 tmux kill-session -t backtest 2>/dev/null
 tmux kill-session -t monitor 2>/dev/null
 tmux kill-session -t impulse 2>/dev/null
+tmux kill-session -t health 2>/dev/null
 sleep 2
 
 # Kill zombie workers
@@ -26,5 +27,8 @@ tmux new-session -d -s monitor "cd /root/trading-system && source venv/bin/activ
 
 # Start impulse agent (runs scan every hour)
 tmux new-session -d -s impulse "cd /root/trading-system && source venv/bin/activate && while true; do python3 agents/impulse_agent.py --mode scan --days 7 2>&1 | tee -a results/impulse.log; sleep 3600; done"
+
+# Start health agent (Doctor)
+tmux new-session -d -s health "cd /root/trading-system && source venv/bin/activate && export TELEGRAM_BOT_TOKEN=8588577391:AAE5poxdFXYDFVlf8fkCe3kZXOGCHRqVFfI && export TELEGRAM_CHAT_ID=438218324 && python3 -u agents/health_agent.py 2>&1 | tee results/health.log"
 
 echo "[$(date)] Restart complete" >> /root/trading-system/results/restart.log

@@ -18,6 +18,16 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+
+def sf(val, default=0.0):
+    """Safe float — handles None, strings, dicts. Use before :.Xf formatting."""
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
 from strategy.base_strategy import load_params, save_params
 from agents.optimizer_agent import suggest_change, PARAM_RANGES
 from agents.analyst_agent import run_analysis, apply_recommendations
@@ -31,8 +41,77 @@ RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
 REQUEST_FILE = os.path.join(RUNTIME_DIR, "backtest_request.json")
 DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 
-TIMEOUT_BACKTEST_DAY = 1800   # 30 min for 1-2 core instruments (GBP_USD only during day)
-TIMEOUT_BACKTEST_NIGHT = 3600  # 60 min for 7 instruments during night
+
+def update_excluded_instruments(db_path, min_iterations=10):
+    """Анализирует историю и исключает стабильно убыточные пары."""
+    import json
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    
+    # Get last 10 iterations with per-instrument scores
+    cur.execute("SELECT params_snapshot, avg_score FROM experiments WHERE action IN (keep,revert,baseline) ORDER BY rowid DESC LIMIT ?", (min_iterations,))
+    rows = cur.fetchall()
+    conn.close()
+    
+    if len(rows) < min_iterations:
+        return []
+    
+    # Aggregate per-instrument scores from backtest results
+    pair_scores = {}
+    for snapshot_json, _ in rows:
+        if not snapshot_json:
+            continue
+    
+    # Use last N*16 rows from instrument_metrics (N iterations * 16 pairs)
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT instrument, AVG(score), COUNT(*), AVG(winrate), SUM(total_trades)
+            FROM (
+                SELECT * FROM instrument_metrics 
+                WHERE score > -900
+                ORDER BY rowid DESC 
+                LIMIT ?
+            )
+            GROUP BY instrument
+        """, (min_iterations * 20,))
+        rows = cur.fetchall()
+    except:
+        conn.close()
+        return []
+    conn.close()
+    
+    if not rows:
+        return []
+    
+    excluded = []
+    kept = []
+    for inst, avg_score, count, avg_wr, total_trades in rows:
+        # Exclude if: avg_score negative AND at least 3 data points AND WR < 45%
+        if avg_score is not None and avg_score < -0.5 and count >= 3 and (avg_wr or 0) < 0.45:
+            excluded.append({"instrument": inst, "avg_score": round(avg_score, 2), "avg_wr": round(avg_wr or 0, 2), "trades": int(total_trades or 0)})
+        else:
+            kept.append(inst)
+    
+    # Save to runtime
+    excluded_file = os.path.join(RUNTIME_DIR, "excluded_instruments.json")
+    excluded_names = [e["instrument"] for e in excluded]
+    with open(excluded_file, "w") as f:
+        json.dump({"excluded": excluded_names, "details": excluded, "kept": kept}, f, indent=2)
+    
+    if excluded:
+        msg = "🗑 Исключены убыточные пары:\n" + "\n".join(
+            f"  ❌ {e['instrument']}: avg_score={e['avg_score']}, WR={sf(e['avg_wr']):.0%}, {e['trades']} trades"
+            for e in excluded
+        )
+        print(f"  [Pair Filter] {msg}")
+        send_telegram(msg)
+    
+    return excluded_names
+
+TIMEOUT_BACKTEST_DAY = 7200   # 30 min for 1-2 core instruments (GBP_USD only during day)
+TIMEOUT_BACKTEST_NIGHT = 7200  # 60 min for 7 instruments during night
 
 
 def is_night_mode():
@@ -155,10 +234,16 @@ def is_anomaly(new_score, best_score, total_trades):
     """Определяет аномальные результаты бэктеста.
     - score < -100: явно сломано (< 10 trades = -999)
     - score < -10 и < 30 trades: недостаточно данных для надёжного результата
+    - score > 10: аномально высокий (один инструмент доминирует)
+    - score скачок > 50x от best: нереалистичное улучшение
     """
     if new_score < -100:
         return True
     if new_score < -10 and total_trades < 30:
+        return True
+    if new_score > 10:
+        return True
+    if best_score > 0 and new_score > best_score * 50:
         return True
     return False
 
@@ -178,7 +263,7 @@ def save_snapshot(params, score):
         json.dump(params, f, indent=2)
     with open(SNAPSHOT_SCORE_PATH, "w") as f:
         json.dump({"score": score, "timestamp": time.time()}, f)
-    print(f"  [Snapshot] Saved (score: {score:.4f})")
+    print(f"  [Snapshot] Saved (score: {sf(score):.4f})")
 
 
 def restore_snapshot():
@@ -192,7 +277,7 @@ def restore_snapshot():
         with open(SNAPSHOT_SCORE_PATH) as f:
             score = json.load(f).get("score", 0)
     save_params(params)
-    print(f"  [Snapshot] Restored (score: {score:.4f})")
+    print(f"  [Snapshot] Restored (score: {sf(score):.4f})")
     return params, score
 
 
@@ -321,7 +406,11 @@ def save_experiment(iteration, suggestion, backtest_result, action, params):
                 best_score = m["score"]
                 best_inst = inst
 
-    if scores:
+    # Filter out -999 (too few trades) from average
+    valid_scores = [s for s in scores if s > -900]
+    if valid_scores:
+        avg_score = sum(valid_scores) / len(valid_scores)
+    elif scores:
         avg_score = sum(scores) / len(scores)
     else:
         avg_score = backtest_result.get("avg_score", 0)
@@ -372,10 +461,10 @@ def send_night_report(night_results):
     for inst in sorted(night_results.keys()):
         r = night_results[inst]
         emoji = "✅" if r.get("total_r", 0) > 0 else "❌"
-        line = (f"  {emoji} {inst}: score={r.get('score', 0):.2f}, "
-                f"WR={r.get('winrate', 0):.0%}, "
-                f"{r.get('total_r', 0):+.0f}R, "
-                f"PF={r.get('profit_factor', 0):.1f} "
+        line = (f"  {emoji} {inst}: score={sf(r.get('score', 0)):.2f}, "
+                f"WR={sf(r.get('winrate', 0)):.0%}, "
+                f"{sf(r.get('total_r', 0)):+.0f}R, "
+                f"PF={sf(r.get('profit_factor', 0)):.1f} "
                 f"({r.get('trades', 0)} trades)")
         if inst in CORE_INSTRUMENTS:
             core_lines.append(line)
@@ -432,6 +521,7 @@ def run(max_iterations=100, skip_data_download=False):
     baseline_score = baseline_result.get("avg_score", 0)
 
     save_experiment(0, {"param": "baseline", "reasoning": "Initial baseline"}, baseline_result, "baseline", params)
+    baseline_score = sf(baseline_score)
     print(f"\n  Baseline avg_score: {baseline_score:.4f}")
 
     best_score = baseline_score
@@ -449,7 +539,7 @@ def run(max_iterations=100, skip_data_download=False):
         night = is_night_mode()
         mode_str = "🌙 NIGHT (Opus+all)" if night else "☀️ DAY (Sonnet+core)"
         print(f"\n{'=' * 60}")
-        print(f"[Iteration {i}/{max_iterations}] {mode_str} (reverts: {consecutive_reverts}, best: {best_score:.4f})")
+        print(f"[Iteration {i}/{max_iterations}] {mode_str} (reverts: {consecutive_reverts}, best: {sf(best_score):.4f})")
         print(f"{'=' * 60}")
 
         # Переход ночь→день: отправить ночной отчёт
@@ -526,6 +616,11 @@ def run(max_iterations=100, skip_data_download=False):
                         new_params[group][key] = ch["new_value"]
                     else:
                         new_params[p] = ch["new_value"]
+                        # Propagate to overrides
+                        for group in ("forex_overrides", "crypto_overrides"):
+                            if group in new_params and p in new_params[group]:
+                                new_params[group][p] = ch["new_value"]
+                                print(f"  [Propagate] {group}.{p} = {ch['new_value']}")
             elif "." in param_name:
                 group, key = param_name.split(".", 1)
                 if group not in new_params:
@@ -533,6 +628,12 @@ def run(max_iterations=100, skip_data_download=False):
                 new_params[group][key] = suggestion["new_value"]
             else:
                 new_params[param_name] = suggestion["new_value"]
+                # Propagate to overrides if they contain this param
+                # (overrides take priority in generate_signals, so global-only change has no effect)
+                for group in ("forex_overrides", "crypto_overrides"):
+                    if group in new_params and param_name in new_params[group]:
+                        new_params[group][param_name] = suggestion["new_value"]
+                        print(f"  [Propagate] {group}.{param_name} = {suggestion['new_value']}")
             save_params(new_params)
 
         # Backtest
@@ -541,7 +642,7 @@ def run(max_iterations=100, skip_data_download=False):
         request_backtest(new_params, request_id, changed_param=param_name)
         bt_result = wait_for_backtest(request_id)
 
-        new_score = bt_result.get("avg_score", 0)
+        new_score = sf(bt_result.get("avg_score", 0))
         total_trades_new = sum(
             m.get("total_trades", 0) for m in bt_result.get("results", {}).values() if m
         )
@@ -560,7 +661,7 @@ def run(max_iterations=100, skip_data_download=False):
 
         # === ANOMALY DETECTOR ===
         if is_anomaly(new_score, best_score, total_trades_new):
-            print(f"\n  ANOMALY: score={new_score:.4f}, trades={total_trades_new} — skipping")
+            print(f"\n  ANOMALY: score={sf(new_score):.4f}, trades={total_trades_new} — skipping")
             save_params(params_backup)
             save_experiment(i, suggestion, bt_result, "anomaly", new_params)
             blacklist.record_revert(param_name, i)
@@ -582,19 +683,19 @@ def run(max_iterations=100, skip_data_download=False):
             consecutive_reverts = 0
             blacklist.record_keep(param_name)
             if improvement > 0:
-                print(f"\n  KEEP: score {new_score:.4f} (+{improvement:.4f})")
+                print(f"\n  KEEP: score {sf(new_score):.4f} (+{sf(improvement):.4f})")
             else:
-                print(f"\n  KEEP (explore): score {new_score:.4f} (best: {best_score:.4f}, within {explore_tolerance:.0%})")
+                print(f"\n  KEEP (explore): score {sf(new_score):.4f} (best: {sf(best_score):.4f}, within {sf(explore_tolerance):.0%})")
         else:
             action = "revert"
             if change_type == "code_change" and strategy_backup:
                 strategy_path = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_strategy.py")
                 with open(strategy_path, "w") as f:
                     f.write(strategy_backup)
-                print(f"\n  REVERT CODE: score {new_score:.4f} (best: {best_score:.4f})")
+                print(f"\n  REVERT CODE: score {sf(new_score):.4f} (best: {sf(best_score):.4f})")
             else:
                 save_params(params_backup)
-                print(f"\n  REVERT: score {new_score:.4f} (threshold: {score_threshold:.4f})")
+                print(f"\n  REVERT: score {sf(new_score):.4f} (threshold: {sf(score_threshold):.4f})")
             no_improvement_count += 1
             consecutive_reverts += 1
             blacklist.record_revert(param_name, i)
@@ -608,7 +709,7 @@ def run(max_iterations=100, skip_data_download=False):
             baseline_trades = baseline_result.get("results", {})
             baseline_total = sum(m.get("total_trades", 0) for m in baseline_trades.values() if m)
             if baseline_total > 0 and total_trades_new < baseline_total * 0.8:
-                warnings.append(f"Trades dropped {baseline_total} -> {total_trades_new} ({total_trades_new/baseline_total:.0%})")
+                warnings.append(f"Trades dropped {baseline_total} -> {total_trades_new} ({sf(total_trades_new/baseline_total):.0%})")
 
             # Check 2: single instrument dominance (>60% of total score)
             inst_results = bt_result.get("results", {})
@@ -622,12 +723,17 @@ def run(max_iterations=100, skip_data_download=False):
                 if total_score_abs > 0:
                     for inst, s in inst_scores.items():
                         if abs(s) / total_score_abs > 0.6:
-                            warnings.append(f"{inst} dominates score ({s:.2f} = {abs(s)/total_score_abs:.0%})")
+                            warnings.append(f"{inst} dominates score ({sf(s):.2f} = {sf(abs(s)/total_score_abs):.0%})")
 
             if warnings:
                 warn_msg = " | ".join(warnings)
-                print(f"\n  [Overfitting] WARNING: {warn_msg}")
-                send_telegram(f"Overfitting warning (iter {i}):\n{warn_msg}")
+                print(f"\n  [Overfitting] REVERT: {warn_msg}")
+                send_telegram(f"Overfitting REVERT (iter {i}):\n{warn_msg}")
+                save_params(params_backup)
+                save_experiment(i, suggestion, bt_result, "overfitting", new_params)
+                blacklist.record_revert(param_name, i)
+                consecutive_reverts += 1
+                continue
 
         # === STUCK DETECTOR ===
         if consecutive_reverts >= 7 and not ranges_expanded:
@@ -638,14 +744,14 @@ def run(max_iterations=100, skip_data_download=False):
                 f"⚠️ <b>Stuck detected!</b>\n"
                 f"{consecutive_reverts} reverts подряд (iter {i})\n"
                 f"Диапазоны расширены на 20%\n"
-                f"Best score: {best_score:.4f}"
+                f"Best score: {sf(best_score):.4f}"
             )
 
         if consecutive_reverts >= 15:
             send_telegram(
                 f"🔴 <b>Система застряла!</b>\n"
                 f"{consecutive_reverts} reverts подряд\n"
-                f"Score: {best_score:.4f}\n"
+                f"Score: {sf(best_score):.4f}\n"
                 f"Нужно вмешательство CEO"
             )
 
@@ -662,10 +768,10 @@ def run(max_iterations=100, skip_data_download=False):
                     send_telegram(
                         f"🔄 <b>Автооткат!</b>\n"
                         f"Рекомендации AnalystAgent ухудшили систему\n"
-                        f"Score: {snap_score:.2f} → {old_score:.2f} (деградация > 20%)\n"
+                        f"Score: {sf(snap_score):.2f} → {sf(old_score):.2f} (деградация > 20%)\n"
                         f"Восстановлены params из snapshot"
                     )
-                    print(f"  [Degradation] Auto-rollback! Score {old_score:.4f} → restored {snap_score:.4f}")
+                    print(f"  [Degradation] Auto-rollback! Score {sf(old_score):.4f} → restored {sf(snap_score):.4f}")
                     consecutive_reverts = 0
 
         # === TRADE ANALYST (каждые 15 итераций — глубокий анализ сделок) ===
@@ -681,12 +787,21 @@ def run(max_iterations=100, skip_data_download=False):
                     for r in recs:
                         if r.get("confidence", 0) >= 0.7:
                             send_telegram(
-                                f"Trade Analyst rec ({r.get('confidence', 0):.0%}):\n"
+                                f"Trade Analyst rec ({sf(r.get('confidence', 0)):.0%}):\n"
                                 f"{r.get('description', '')}\n"
                                 f"Impact: {r.get('expected_impact', '')}"
                             )
             except Exception as e:
                 print(f"  [TradeAnalyst] Error: {e}")
+
+        # === PAIR FILTER (каждые 10 итераций — отсев убыточных) ===
+        if i % 10 == 0 and i > 0:
+            try:
+                excluded = update_excluded_instruments(DB_PATH, min_iterations=10)
+                if excluded:
+                    print(f"  [Pair Filter] Excluded {len(excluded)} pairs: {excluded}")
+            except Exception as e:
+                print(f"  [Pair Filter] Error: {e}")
 
         # === ANALYST AGENT (каждые 10 итераций) ===
         if i % 10 == 0:
@@ -720,7 +835,7 @@ def run(max_iterations=100, skip_data_download=False):
                         # Остальные — в Telegram для CEO
                         for r in ceo_recs:
                             send_telegram(
-                                f"🔍 Analyst рекомендует (confidence: {r.get('confidence', 0):.0%})\n"
+                                f"🔍 Analyst рекомендует (confidence: {sf(r.get('confidence', 0)):.0%})\n"
                                 f"{r.get('type', 'unknown')}: {r.get('description', 'N/A')}\n"
                                 f"{r.get('reasoning', '')}\n"
                                 f"Применить? Ответь в чате с Claude Code"
@@ -757,7 +872,7 @@ def run(max_iterations=100, skip_data_download=False):
 
     # Финал
     print(f"\n{'=' * 60}")
-    print(f"ORCHESTRATOR v3: Complete. Best score: {best_score:.4f}")
+    print(f"ORCHESTRATOR v3: Complete. Best score: {sf(best_score):.4f}")
     print(f"{'=' * 60}")
     generate_report(best_score)
 
@@ -769,7 +884,7 @@ def generate_report(best_score):
     report = f"""# Autoresearch Report
 Generated: {now}
 
-## Best Score: {best_score:.4f}
+## Best Score: {sf(best_score):.4f}
 
 ## Optimized Parameters
 ```json

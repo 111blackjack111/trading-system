@@ -101,6 +101,7 @@ def check_1_tmux_sessions():
         "orchestrator": f"cd {BASE_DIR} && source {VENV} && python3 agents/orchestrator_v2.py --iterations 100 --skip-data 2>&1 | tee results/orchestrator.log",
         "monitor": f"cd {BASE_DIR} && source {VENV} && export TELEGRAM_BOT_TOKEN={TG_TOKEN} && export TELEGRAM_CHAT_ID={TG_CHAT} && python3 -u agents/monitor_agent.py 2>&1 | tee results/monitor.log",
         "impulse": f"cd {BASE_DIR} && source {VENV} && while true; do python3 agents/impulse_agent.py --mode scan --days 7 2>&1 | tee -a results/impulse.log; sleep 3600; done",
+        "health": f"cd {BASE_DIR} && source {VENV} && export TELEGRAM_BOT_TOKEN={TG_TOKEN} && export TELEGRAM_CHAT_ID={TG_CHAT} && python3 -u agents/health_agent.py 2>&1 | tee results/health.log",
     }
     for name, cmd in sessions.items():
         if not tmux_alive(name):
