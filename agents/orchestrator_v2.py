@@ -630,7 +630,8 @@ def run(max_iterations=100, skip_data_download=True):
                 val = suggestion["new_value"]
                 # Convert bool params: optimizer returns 0/1, strategy expects True/False
                 BOOL_PARAMS = {"sweep_filter", "choch_filter", "ob_confluence", "monday_filter",
-                               "session_filter", "volatility_filter", "news_filter"}
+                               "session_filter", "volatility_filter", "news_filter",
+                               "premium_discount_filter", "ict_sequence_filter", "smt_filter"}
                 if param_name in BOOL_PARAMS:
                     val = bool(int(val))
                 new_params[param_name] = val

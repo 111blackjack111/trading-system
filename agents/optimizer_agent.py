@@ -63,6 +63,9 @@ PARAM_RANGES = {
     "choch_filter": (0, 1),
     "ob_confluence": (0, 1),
     "monday_filter": (0, 1),
+    "premium_discount_filter": (0, 1),
+    "ict_sequence_filter": (0, 1),
+    "smt_filter": (0, 1),
 }
 
 

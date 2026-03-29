@@ -35,6 +35,7 @@ ENTRY_PARAMS = {
     "ny_instruments", "volatility_filter", "min_atr_percentile",
     "confirmation_candle_pct", "asian_filter_forex", "monday_filter",
     "crypto_hours_filter", "news_filter", "news_minutes_before", "news_minutes_after",
+    "premium_discount_filter", "ict_sequence_filter", "smt_filter", "smt_lookback",
 }
 
 
@@ -217,8 +218,18 @@ def run_backtest(instrument, params=None, use_cache=True):
         print(f"  Running backtest: {instrument} (CACHED, {len(raw_signals)} raw signals)")
     else:
         print(f"  Running backtest: {instrument} (H1: {len(df_h1)}, M3: {len(df_m3)} candles)")
+        # Загружаем данные коррелированной пары для SMT
+        from strategy.base_strategy import SMT_PAIRS
+        df_h1_corr = None
+        if params.get("smt_filter", False):
+            corr_inst = SMT_PAIRS.get(instrument)
+            if corr_inst:
+                df_h1_corr = load_data(corr_inst, "H1")
+                if df_h1_corr is not None:
+                    print(f"  SMT: loaded {corr_inst} H1 ({len(df_h1_corr)} bars)")
+
         # Генерируем сырые сигналы (дорогой шаг)
-        raw_signals = generate_signals(df_h1, df_m3, params, instrument=instrument)
+        raw_signals = generate_signals(df_h1, df_m3, params, instrument=instrument, df_h1_correlated=df_h1_corr)
         print(f"  Raw signals found: {len(raw_signals)}")
         # Сохраняем в кеш
         if use_cache:

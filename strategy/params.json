@@ -41,5 +41,9 @@
   "ny_instruments": [
     "USD_JPY"
   ],
-  "monday_filter": false
+  "monday_filter": false,
+  "premium_discount_filter": false,
+  "ict_sequence_filter": false,
+  "smt_filter": false,
+  "smt_lookback": 20
 }

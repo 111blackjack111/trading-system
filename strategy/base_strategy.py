@@ -340,6 +340,68 @@ def is_asian_session(timestamp):
 
 
 # ============================================================
+# SMT Divergence
+# ============================================================
+
+SMT_PAIRS = {
+    "EUR_USD": "GBP_USD",
+    "GBP_USD": "EUR_USD",
+    "USD_JPY": "EUR_JPY",
+    "EUR_JPY": "USD_JPY",
+    "AUD_USD": "NZD_USD",
+    "NZD_USD": "AUD_USD",
+    "AUD_JPY": "NZD_JPY",
+    "NZD_JPY": "AUD_JPY",
+    "GBP_JPY": "EUR_JPY",
+    "EUR_AUD": "GBP_AUD",
+    "GBP_AUD": "EUR_AUD",
+}
+
+
+def _compute_smt_divergence(df_main, df_corr, swing_length, lookback=20):
+    """
+    Compute SMT divergence between main and correlated pair.
+    Returns array: 1 = bullish div (bearish signal), -1 = bearish div (bullish signal), 0 = no div.
+
+    Bullish divergence: main makes new swing HIGH but correlated doesn't → weakness → bearish signal
+    Bearish divergence: main makes new swing LOW but correlated doesn't → weakness → bullish signal
+    """
+    sh_main, sl_main = detect_swing_points(df_main, swing_length)
+    sh_corr, sl_corr = detect_swing_points(df_corr, swing_length)
+
+    # Align by timestamp
+    corr_idx_map = {ts: i for i, ts in enumerate(df_corr.index)}
+    n = len(df_main)
+    div = np.zeros(n, dtype=int)
+
+    for i in range(lookback + 1, n):
+        main_ts = df_main.index[i]
+        corr_i = corr_idx_map.get(main_ts.floor("h"))
+        if corr_i is None:
+            continue
+
+        # Check recent swing highs in main
+        main_recent_sh = [sh_main[k] for k in range(max(0, i - lookback), i) if not np.isnan(sh_main[k])]
+        # Current bar has new high above all recent swing highs?
+        if main_recent_sh and not np.isnan(sh_main[i]):
+            if sh_main[i] > max(main_recent_sh):
+                # Check correlated: did it also make new high?
+                corr_recent_sh = [sh_corr[k] for k in range(max(0, corr_i - lookback), min(corr_i + 1, len(sh_corr))) if not np.isnan(sh_corr[k])]
+                if corr_recent_sh and (np.isnan(sh_corr[min(corr_i, len(sh_corr)-1)]) or sh_corr[min(corr_i, len(sh_corr)-1)] <= max(corr_recent_sh)):
+                    div[i] = 1  # Bullish div = bearish signal
+
+        # Check recent swing lows in main
+        main_recent_sl = [sl_main[k] for k in range(max(0, i - lookback), i) if not np.isnan(sl_main[k])]
+        if main_recent_sl and not np.isnan(sl_main[i]):
+            if sl_main[i] < min(main_recent_sl):
+                corr_recent_sl = [sl_corr[k] for k in range(max(0, corr_i - lookback), min(corr_i + 1, len(sl_corr))) if not np.isnan(sl_corr[k])]
+                if corr_recent_sl and (np.isnan(sl_corr[min(corr_i, len(sl_corr)-1)]) or sl_corr[min(corr_i, len(sl_corr)-1)] >= min(corr_recent_sl)):
+                    div[i] = -1  # Bearish div = bullish signal
+
+    return div
+
+
+# ============================================================
 # Генератор сигналов
 # ============================================================
 
@@ -350,7 +412,7 @@ def is_crypto_instrument(instrument):
     return instrument in crypto if instrument else False
 
 
-def generate_signals(df_h1, df_m3, params, instrument=None):
+def generate_signals(df_h1, df_m3, params, instrument=None, df_h1_correlated=None):
     """
     Генерирует торговые сигналы на основе SMC логики.
 
@@ -377,6 +439,8 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
     use_ob_filter = params.get("ob_confluence", True)
     use_sweep_filter = params.get("sweep_filter", True)
     use_choch = params.get("choch_filter", False)
+    use_premium_discount = params.get("premium_discount_filter", False)
+    use_ict_sequence = params.get("ict_sequence_filter", False)
 
     # 1. Определяем тренд на H1
     trend = detect_bos(df_h1, params["bos_swing_length"])
@@ -391,11 +455,28 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
     # 4. Order Blocks (для confluence фильтра)
     ob_list = detect_order_blocks(df_h1, params["bos_swing_length"]) if use_ob_filter else []
 
-    # 5. Swing points (для liquidity sweep)
+    # 5. Swing points (для liquidity sweep + premium/discount)
     swing_highs, swing_lows = detect_swing_points(df_h1, params["bos_swing_length"])
 
     # 6. CHoCH (ранние развороты)
     choch = detect_choch(df_h1, params["bos_swing_length"]) if use_choch else None
+
+    # 7. Pre-compute sweeps for ICT sequence filter
+    if use_ict_sequence:
+        n_h1 = len(df_h1)
+        bull_sweeps = np.zeros(n_h1, dtype=bool)
+        bear_sweeps = np.zeros(n_h1, dtype=bool)
+        for k in range(22, n_h1):
+            sw = detect_liquidity_sweep(df_h1, k, swing_highs, swing_lows)
+            if sw == "bullish_sweep":
+                bull_sweeps[k] = True
+            elif sw == "bearish_sweep":
+                bear_sweeps[k] = True
+
+    # 8. SMT Divergence
+    smt_div = None
+    if params.get("smt_filter", False) and df_h1_correlated is not None:
+        smt_div = _compute_smt_divergence(df_h1, df_h1_correlated, params["bos_swing_length"])
 
     signals = []
     active_fvgs = []  # FVG которые ещё не отработали
@@ -497,6 +578,65 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                     remaining_fvgs.append(fvg)
                     continue
                 # sweep совпал с FVG — входим
+
+            # ICT 2022 Sequence: Sweep → BOS/CHoCH → FVG (strict order)
+            if use_ict_sequence and current_h1_idx is not None:
+                fvg_idx = fvg["index"]
+                sweep_arr = bull_sweeps if fvg["type"] == "bullish" else bear_sweeps
+                # Find sweep before FVG (within 30 bars)
+                sweep_idx = None
+                for k in range(fvg_idx - 1, max(fvg_idx - 30, 0), -1):
+                    if sweep_arr[k]:
+                        sweep_idx = k
+                        break
+                if sweep_idx is None:
+                    remaining_fvgs.append(fvg)
+                    continue
+                # Find BOS/CHoCH between sweep and FVG
+                direction_val = 1 if fvg["type"] == "bullish" else -1
+                structure_found = False
+                for k in range(sweep_idx + 1, fvg_idx):
+                    if trend.iloc[k] == direction_val:
+                        structure_found = True
+                        break
+                    if use_choch and choch is not None and choch.iloc[k] == direction_val:
+                        structure_found = True
+                        break
+                if not structure_found:
+                    remaining_fvgs.append(fvg)
+                    continue
+
+            # Premium/Discount: buy in discount, sell in premium
+            if use_premium_discount and current_h1_idx is not None:
+                recent_sh = None
+                recent_sl = None
+                for k in range(current_h1_idx, max(current_h1_idx - 50, 0), -1):
+                    if recent_sh is None and not np.isnan(swing_highs[k]):
+                        recent_sh = swing_highs[k]
+                    if recent_sl is None and not np.isnan(swing_lows[k]):
+                        recent_sl = swing_lows[k]
+                    if recent_sh is not None and recent_sl is not None:
+                        break
+                if recent_sh is not None and recent_sl is not None and recent_sh > recent_sl:
+                    equilibrium = (recent_sh + recent_sl) / 2
+                    price = df_m3["close"].iloc[i]
+                    if fvg["type"] == "bullish" and price > equilibrium:
+                        remaining_fvgs.append(fvg)
+                        continue  # Price in premium — skip long
+                    if fvg["type"] == "bearish" and price < equilibrium:
+                        remaining_fvgs.append(fvg)
+                        continue  # Price in discount — skip short
+
+            # SMT Divergence: skip if correlated pair diverges
+            if smt_div is not None and current_h1_idx is not None:
+                if current_h1_idx < len(smt_div):
+                    div = smt_div[current_h1_idx]
+                    if fvg["type"] == "bullish" and div == -1:
+                        remaining_fvgs.append(fvg)
+                        continue  # Bearish divergence — don't go long
+                    if fvg["type"] == "bearish" and div == 1:
+                        remaining_fvgs.append(fvg)
+                        continue  # Bullish divergence — don't go short
 
             close = df_m3["close"].iloc[i]
             low = df_m3["low"].iloc[i]
