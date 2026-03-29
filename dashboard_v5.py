@@ -67,7 +67,7 @@ def _cached(key, fn):
     try:
         result = fn()
     except Exception:
-        return _cache.get(key, [({}, 0)])[0]
+        return _cache.get(key, (None, 0))[0]
     _cache[key] = (result, now)
     return result
 
@@ -84,6 +84,12 @@ def get_last_experiment_time():
         conn.close()
         if row and row[0]:
             ts = row[0].replace("T", " ")
+            # Strip timezone suffix (+00:00 or Z)
+            if "+" in ts:
+                ts = ts[:ts.index("+")]
+            elif ts.endswith("Z"):
+                ts = ts[:-1]
+            ts = ts.strip()
             if "." in ts:
                 return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
             return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
@@ -99,7 +105,7 @@ def get_cutoff_timestamp(time_range):
         return None
     ref = get_last_experiment_time() or datetime.now()
     cutoff = ref - delta
-    return cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    return cutoff.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # --------------- data fetching ---------------

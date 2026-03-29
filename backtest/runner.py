@@ -8,6 +8,8 @@ import os
 import sys
 import json
 import math
+import hashlib
+import pickle
 
 import numpy as np
 import pandas as pd
@@ -17,11 +19,65 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from strategy.base_strategy import (
     load_params,
     generate_signals,
+    compute_trade_levels,
     simulate_trades,
 )
 
 CSV_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "csv")
 RUNTIME_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime")
+SIGNAL_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "runtime", "signal_cache")
+
+# Entry-only params — если меняется один из них, кеш инвалидируется
+ENTRY_PARAMS = {
+    "bos_swing_length", "fvg_min_size_multiplier", "fvg_entry_depth",
+    "fvg_max_age_bars", "ob_lookback", "ob_confluence", "sweep_filter",
+    "choch_filter", "session_filter", "silver_bullet_only", "ny_session",
+    "ny_instruments", "volatility_filter", "min_atr_percentile",
+    "confirmation_candle_pct", "asian_filter_forex", "monday_filter",
+    "crypto_hours_filter", "news_filter", "news_minutes_before", "news_minutes_after",
+}
+
+
+def _entry_params_hash(params, instrument):
+    """Хеш entry-параметров для ключа кеша."""
+    from strategy.base_strategy import is_crypto_instrument
+    is_crypto = is_crypto_instrument(instrument)
+
+    # Apply overrides same way as generate_signals does
+    p = params.copy()
+    if is_crypto and "crypto_overrides" in p:
+        p.update(p["crypto_overrides"])
+    elif not is_crypto and "forex_overrides" in p:
+        p.update(p["forex_overrides"])
+
+    # Extract only entry params
+    entry_vals = {k: p.get(k) for k in sorted(ENTRY_PARAMS) if k in p}
+    key_str = json.dumps(entry_vals, sort_keys=True, default=str)
+    return hashlib.md5(key_str.encode()).hexdigest()[:12]
+
+
+def _cache_path(instrument, params_hash):
+    return os.path.join(SIGNAL_CACHE_DIR, f"{instrument}_{params_hash}.pkl")
+
+
+def _load_cached_signals(instrument, params_hash):
+    """Загрузить кешированные сырые сигналы."""
+    path = _cache_path(instrument, params_hash)
+    if os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _save_cached_signals(instrument, params_hash, raw_signals):
+    """Сохранить сырые сигналы в кеш."""
+    os.makedirs(SIGNAL_CACHE_DIR, exist_ok=True)
+    path = _cache_path(instrument, params_hash)
+    with open(path, "wb") as f:
+        pickle.dump(raw_signals, f)
 
 
 def load_data(instrument, timeframe):
@@ -109,7 +165,7 @@ def calculate_score(sharpe, profit_factor, max_drawdown, winrate, total_trades):
     sharpe is capped to [-3, 3].
     No double penalty. Single clear formula.
     """
-    if total_trades < 10:
+    if total_trades < 5:
         return -999
 
     quality = winrate * profit_factor  # WR × PF: core metric
@@ -125,13 +181,16 @@ def calculate_score(sharpe, profit_factor, max_drawdown, winrate, total_trades):
     return score
 
 
-def run_backtest(instrument, params=None):
+def run_backtest(instrument, params=None, use_cache=True):
     """
     Запускает бэктест для одного инструмента.
+    С кешированием сырых сигналов: если entry-параметры не изменились,
+    пропускает дорогой generate_signals() и только пересчитывает exit-уровни.
 
     Args:
         instrument: название (e.g. "GBP_USD", "BTCUSDT")
         params: dict параметров или None (загрузит из params.json)
+        use_cache: использовать кеш сигналов (default True)
 
     Returns:
         dict: метрики + список сделок
@@ -147,11 +206,27 @@ def run_backtest(instrument, params=None):
         print(f"  No data for {instrument}")
         return {"instrument": instrument, "error": "no_data", "metrics": None}
 
-    print(f"  Running backtest: {instrument} (H1: {len(df_h1)}, M3: {len(df_m3)} candles)")
+    # Проверяем кеш сырых сигналов
+    params_hash = _entry_params_hash(params, instrument)
+    raw_signals = None
 
-    # Генерируем сигналы
-    signals = generate_signals(df_h1, df_m3, params, instrument=instrument)
-    print(f"  Signals found: {len(signals)}")
+    if use_cache:
+        raw_signals = _load_cached_signals(instrument, params_hash)
+
+    if raw_signals is not None:
+        print(f"  Running backtest: {instrument} (CACHED, {len(raw_signals)} raw signals)")
+    else:
+        print(f"  Running backtest: {instrument} (H1: {len(df_h1)}, M3: {len(df_m3)} candles)")
+        # Генерируем сырые сигналы (дорогой шаг)
+        raw_signals = generate_signals(df_h1, df_m3, params, instrument=instrument)
+        print(f"  Raw signals found: {len(raw_signals)}")
+        # Сохраняем в кеш
+        if use_cache:
+            _save_cached_signals(instrument, params_hash, raw_signals)
+
+    # Вычисляем exit-уровни (дешёвый шаг)
+    signals = compute_trade_levels(raw_signals, params, instrument=instrument)
+    print(f"  Signals with valid levels: {len(signals)}")
 
     # Симулируем сделки
     trades = simulate_trades(signals, df_m3, params, instrument=instrument)
@@ -165,6 +240,14 @@ def run_backtest(instrument, params=None):
         "metrics": metrics,
         "trades": trades,
     }
+
+
+def clear_signal_cache():
+    """Очищает весь кеш сигналов."""
+    if os.path.exists(SIGNAL_CACHE_DIR):
+        import shutil
+        shutil.rmtree(SIGNAL_CACHE_DIR)
+        print("  [Cache] Signal cache cleared")
 
 
 # Active instruments — only these are used for optimization

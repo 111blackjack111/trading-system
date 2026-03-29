@@ -49,7 +49,7 @@ def update_excluded_instruments(db_path, min_iterations=10):
     cur = conn.cursor()
     
     # Get last 10 iterations with per-instrument scores
-    cur.execute("SELECT params_snapshot, avg_score FROM experiments WHERE action IN (keep,revert,baseline) ORDER BY rowid DESC LIMIT ?", (min_iterations,))
+    cur.execute("SELECT params_snapshot, avg_score FROM experiments WHERE action IN ('keep','revert','baseline') ORDER BY rowid DESC LIMIT ?", (min_iterations,))
     rows = cur.fetchall()
     conn.close()
     
@@ -493,7 +493,7 @@ def send_night_report(night_results):
 # Main loop
 # ============================================================
 
-def run(max_iterations=100, skip_data_download=False):
+def run(max_iterations=100, skip_data_download=True):
     init_db()
     blacklist = ParamBlacklist()
 
@@ -511,7 +511,7 @@ def run(max_iterations=100, skip_data_download=False):
     # Шаг 0: Данные
     if not skip_data_download:
         print("\n[Step 0] Downloading data...")
-        run_data_agent(months=12)
+        run_data_agent(months=48)
 
     # Шаг 1: Baseline
     print("\n[Iteration 0] Baseline backtest...")
@@ -627,7 +627,13 @@ def run(max_iterations=100, skip_data_download=False):
                     new_params[group] = {}
                 new_params[group][key] = suggestion["new_value"]
             else:
-                new_params[param_name] = suggestion["new_value"]
+                val = suggestion["new_value"]
+                # Convert bool params: optimizer returns 0/1, strategy expects True/False
+                BOOL_PARAMS = {"sweep_filter", "choch_filter", "ob_confluence", "monday_filter",
+                               "session_filter", "volatility_filter", "news_filter"}
+                if param_name in BOOL_PARAMS:
+                    val = bool(int(val))
+                new_params[param_name] = val
                 # Propagate to overrides if they contain this param
                 # (overrides take priority in generate_signals, so global-only change has no effect)
                 for group in ("forex_overrides", "crypto_overrides"):
@@ -904,7 +910,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--iterations", type=int, default=100)
-    parser.add_argument("--skip-data", action="store_true")
+    parser.add_argument("--update-data", action="store_true", help="Download fresh data before running")
     args = parser.parse_args()
 
-    run(max_iterations=args.iterations, skip_data_download=args.skip_data)
+    run(max_iterations=args.iterations, skip_data_download=not args.update_data)

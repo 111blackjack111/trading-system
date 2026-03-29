@@ -35,7 +35,7 @@ STRATEGY_PATH = os.path.join(os.path.dirname(__file__), "..", "strategy", "base_
 # Диапазоны параметров для оптимизации
 # Общие параметры (применяются ко всем инструментам)
 PARAM_RANGES = {
-    "fvg_min_size_multiplier": (0.1, 1.0),
+    "fvg_min_size_multiplier": (0.05, 1.5),
     "fvg_entry_depth": (0.2, 0.8),
     "ob_lookback": (5, 30),
     "bos_swing_length": (5, 25),
@@ -43,7 +43,7 @@ PARAM_RANGES = {
     "be_trigger_rr": (0.5, 2.0),
     "tp_rr_ratio": (1.5, 4.0),
     "min_atr_percentile": (15, 70),
-    "fvg_max_age_bars": (5, 50),
+    "fvg_max_age_bars": (3, 80),
     "confirmation_candle_pct": (0.0, 0.8),
     # Группа-специфичные (crypto_overrides.X, forex_overrides.X)
     "crypto_overrides.be_trigger_rr": (0.5, 1.5),
@@ -58,6 +58,11 @@ PARAM_RANGES = {
     "trailing_stop_distance_rr": (0.2, 1.0),
     "partial_tp_rr": (0.5, 2.0),
     "partial_tp_pct": (0.3, 0.7),
+    # Boolean params (0=False, 1=True)
+    "sweep_filter": (0, 1),
+    "choch_filter": (0, 1),
+    "ob_confluence": (0, 1),
+    "monday_filter": (0, 1),
 }
 
 
@@ -401,15 +406,21 @@ def suggest_change(params=None, blacklisted_params=None):
     model = get_optimizer_model()
     print(f"  [Optimizer] Using model: {model} (hour={datetime.now().hour})")
 
-    result = subprocess.run(
-        ["claude", "-p", "--output-format", "text", "--model", model],
-        input=prompt,
-        capture_output=True, text=True, timeout=180,
-        cwd=os.path.join(os.path.dirname(__file__), ".."),
-    )
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Claude CLI error (rc={result.returncode}): {result.stderr[:500]}")
+    import time
+    for attempt in range(10):
+        result = subprocess.run(
+            ["claude", "-p", "--output-format", "text", "--model", model],
+            input=prompt,
+            capture_output=True, text=True, timeout=180,
+            cwd=os.path.join(os.path.dirname(__file__), ".."),
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            break
+        wait = 1800
+        print(f"  [Optimizer] Rate limit, ждём {wait//60} мин (attempt {attempt+1}/10)...")
+        time.sleep(wait)
+    else:
+        raise RuntimeError(f"Claude CLI failed after 10 attempts: rc={result.returncode}")
 
     text = result.stdout.strip()
     if not text:

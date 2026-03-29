@@ -361,7 +361,8 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
         instrument: название инструмента (для определения крипта/форекс)
 
     Returns:
-        list of dict: сигналы [{timestamp, direction, entry, sl, tp, fvg}, ...]
+        list of dict: сырые сигналы [{timestamp, direction, entry, atr_val, fvg}, ...]
+        Без sl/tp/be — они вычисляются в compute_trade_levels().
     """
     is_crypto = is_crypto_instrument(instrument)
 
@@ -532,21 +533,12 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                     if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
                         remaining_fvgs.append(fvg)
                         continue
-                    sl = fvg["bottom"] - atr_val * params["sl_atr_multiplier"]
-                    risk = entry_price - sl
-                    if risk <= 0:
-                        continue
-                    tp = entry_price + risk * params["tp_rr_ratio"]
-                    be_level = entry_price + risk * params["be_trigger_rr"]
 
                     signals.append({
                         "timestamp": entry_ts,
                         "direction": "long",
                         "entry": entry_price,
-                        "sl": sl,
-                        "tp": tp,
-                        "be_level": be_level,
-                        "risk": risk,
+                        "atr_val": atr_val,
                         "fvg": fvg,
                     })
                     continue  # FVG отработал
@@ -576,21 +568,12 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
                     if atr_val is None or np.isnan(atr_val) or atr_val <= 0:
                         remaining_fvgs.append(fvg)
                         continue
-                    sl = fvg["top"] + atr_val * params["sl_atr_multiplier"]
-                    risk = sl - entry_price
-                    if risk <= 0:
-                        continue
-                    tp = entry_price - risk * params["tp_rr_ratio"]
-                    be_level = entry_price - risk * params["be_trigger_rr"]
 
                     signals.append({
                         "timestamp": entry_ts,
                         "direction": "short",
                         "entry": entry_price,
-                        "sl": sl,
-                        "tp": tp,
-                        "be_level": be_level,
-                        "risk": risk,
+                        "atr_val": atr_val,
                         "fvg": fvg,
                     })
                     continue
@@ -600,6 +583,70 @@ def generate_signals(df_h1, df_m3, params, instrument=None):
         active_fvgs = remaining_fvgs
 
     return signals
+
+
+# ============================================================
+# Расчёт торговых уровней (exit-параметры)
+# ============================================================
+
+def compute_trade_levels(raw_signals, params, instrument=None):
+    """
+    Вычисляет sl/tp/be/risk из сырых сигналов + exit-параметров.
+    Фильтрует сигналы с risk <= 0.
+
+    Args:
+        raw_signals: список сырых сигналов из generate_signals()
+        params: словарь параметров (с уже применёнными overrides)
+        instrument: название инструмента
+
+    Returns:
+        list of dict: обогащённые сигналы [{..., sl, tp, be_level, risk}, ...]
+    """
+    is_crypto = is_crypto_instrument(instrument)
+
+    # Применяем overrides
+    params = params.copy()
+    if is_crypto and "crypto_overrides" in params:
+        params.update(params["crypto_overrides"])
+    elif not is_crypto and "forex_overrides" in params:
+        params.update(params["forex_overrides"])
+
+    enriched = []
+    for sig in raw_signals:
+        entry_price = sig["entry"]
+        atr_val = sig["atr_val"]
+        fvg = sig["fvg"]
+        direction = sig["direction"]
+
+        if direction == "long":
+            sl = fvg["bottom"] - atr_val * params["sl_atr_multiplier"]
+            risk = entry_price - sl
+        else:
+            sl = fvg["top"] + atr_val * params["sl_atr_multiplier"]
+            risk = sl - entry_price
+
+        if risk <= 0:
+            continue
+
+        if direction == "long":
+            tp = entry_price + risk * params["tp_rr_ratio"]
+            be_level = entry_price + risk * params["be_trigger_rr"]
+        else:
+            tp = entry_price - risk * params["tp_rr_ratio"]
+            be_level = entry_price - risk * params["be_trigger_rr"]
+
+        enriched.append({
+            "timestamp": sig["timestamp"],
+            "direction": direction,
+            "entry": entry_price,
+            "sl": sl,
+            "tp": tp,
+            "be_level": be_level,
+            "risk": risk,
+            "fvg": fvg,
+        })
+
+    return enriched
 
 
 # ============================================================

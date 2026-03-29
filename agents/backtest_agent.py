@@ -27,14 +27,15 @@ DONE_FILE = os.path.join(RUNTIME_DIR, "backtest_done.json")
 # Проверенные пары (всегда активны) — только GBP_USD показывает стабильный положительный score
 CORE_INSTRUMENTS = {
     "GBP_USD", "EUR_GBP", "USD_JPY", "GBP_JPY",
-}
-
-# Тестовые пары для ночного режима — расширенный набор для тестирования
-NIGHT_INSTRUMENTS = {
-    "EUR_USD", "XAU_USD",
+    "EUR_USD", "NZD_JPY",
     "AUD_USD", "NZD_USD", "USD_CAD", "USD_CHF",
     "EUR_JPY", "AUD_JPY", "CAD_JPY",
-    "EUR_AUD", "GBP_AUD", "GBP_CHF", "NZD_JPY",
+    "EUR_AUD", "GBP_AUD", "GBP_CHF",
+}
+
+# Ночью добавляем XAU_USD (более волатильный)
+NIGHT_INSTRUMENTS = {
+    "XAU_USD",
 }
 # Обратная совместимость
 ACTIVE_INSTRUMENTS = CORE_INSTRUMENTS
@@ -50,7 +51,7 @@ def is_night_mode():
 
 
 def get_instruments():
-    """Определяет инструменты по наличию CSV + режим дня/ночи."""
+    """Определяет инструменты по наличию CSV + режим дня/ночи. Исключает убыточные."""
     active = CORE_INSTRUMENTS | NIGHT_INSTRUMENTS if is_night_mode() else CORE_INSTRUMENTS
     instruments = set()
     if os.path.exists(CSV_DIR):
@@ -59,8 +60,21 @@ def get_instruments():
                 inst = f.replace("_H1.csv", "")
                 if inst in active:
                     instruments.add(inst)
-    mode = "NIGHT (all 12)" if is_night_mode() else "DAY (core 5)"
-    print(f"  [Instruments] {mode}: {sorted(instruments)}")
+    # Exclude unprofitable pairs (updated every 10 iterations by orchestrator)
+    excluded_file = os.path.join(os.path.dirname(__file__), "..", "runtime", "excluded_instruments.json")
+    excluded = set()
+    if os.path.exists(excluded_file):
+        try:
+            import json
+            with open(excluded_file) as f:
+                excluded = set(json.load(f).get("excluded", []))
+            if excluded:
+                instruments -= excluded
+                print(f"  [Instruments] Excluded (unprofitable): {sorted(excluded)}")
+        except Exception:
+            pass
+    mode = "NIGHT (all)" if is_night_mode() else "DAY (core)"
+    print(f"  [Instruments] {mode}: {sorted(instruments)} ({len(instruments)} pairs)")
     return sorted(instruments)
 
 
@@ -78,7 +92,7 @@ def reload_strategy():
     importlib.reload(strategy.base_strategy)
     importlib.reload(backtest.runner)
     # Re-import after reload
-    global run_backtest, calculate_metrics
+    global run_backtest, calculate_metrics, clear_signal_cache
     from backtest.runner import run_backtest, calculate_metrics
     print("  [BacktestAgent] Strategy modules reloaded")
 
@@ -321,7 +335,7 @@ def generate_trade_log(results):
 
 
 CRYPTO_INSTRUMENTS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"}
-FOREX_INSTRUMENTS = {"USD_JPY", "EUR_GBP", "GBP_USD", "GER40", "XAU_USD", "EUR_USD", "GBP_JPY"}
+FOREX_INSTRUMENTS = {"USD_JPY", "EUR_GBP", "GBP_USD", "XAU_USD", "EUR_USD", "GBP_JPY"}
 
 # Кеш последних результатов для частичного пересчёта
 _result_cache = {}
@@ -353,6 +367,7 @@ def watch():
                 request_id = request.get("id", "unknown")
                 changed_group = detect_changed_group(request)
                 print(f"\n[BacktestAgent] Request #{request_id} received (group: {changed_group})")
+
 
                 # Удаляем запрос
                 os.remove(REQUEST_FILE)
@@ -390,7 +405,9 @@ def watch():
                     m = res.get("metrics")
                     if m and m.get("score") is not None:
                         scores.append(m["score"])
-                avg_score = sum(scores) / len(scores) if scores else 0
+                # Filter out -999 (too few trades) from average
+                valid_scores = [s for s in scores if s > -900]
+                avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else (sum(scores) / len(scores) if scores else 0)
 
                 # Пишем результат
                 done = {
